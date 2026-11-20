@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows Installer EXE
 
 on:
   workflow_dispatch:
@@ -27,11 +27,19 @@ jobs:
           python -c "from rembg import new_session; new_session('u2net')"
           Get-ChildItem "$env:U2NET_HOME"
 
-      - name: 5. 打包成 Windows 安装文件夹
+      - name: 5. 准备自定义图标 app.ico
+        run: |
+          if (-not (Test-Path "app.ico")) {
+            python -c "from PIL import Image; img = Image.new('RGBA', (256, 256), (37, 99, 235, 255)); img.save('app.ico', format='ICO', sizes=[(256, 256), (64, 64), (32, 32), (16, 16)])"
+          }
+          Get-Item "app.ico"
+
+      - name: 6. 打包程序根目录（含自定义图标与离线模型）
         run: |
           $env:U2NET_HOME = "$PWD\.u2net"
           pyinstaller --noconfirm --onedir --windowed `
             --name "证件照批量换底色工具-Czq" `
+            --icon="app.ico" `
             --collect-all rembg `
             --collect-all onnxruntime `
             --collect-all tkinterdnd2 `
@@ -39,8 +47,13 @@ jobs:
             --add-data ".u2net;.u2net" `
             "证件照批量换底色.py"
 
-      - name: 6. 上传打包好的软件压缩包
+      - name: 7. 安装 Inno Setup 并编译安装程序 EXE
+        run: |
+          choco install innosetup -y
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer.iss"
+
+      - name: 8. 上传最终安装程序
         uses: actions/upload-artifact@v4
         with:
-          name: 证件照批量换底色工具-Czq
-          path: dist/证件照批量换底色工具/
+          name: 证件照批量换底色工具安装包-Czq
+          path: Output/证件照批量换底色工具_安装程序-Czq.exe
