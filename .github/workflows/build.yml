@@ -31,7 +31,7 @@ jobs:
         run: |
           $env:U2NET_HOME = "$PWD\.u2net"
           pyinstaller --noconfirm --onedir --windowed `
-            --name "证件照批量换底色工具" `
+            --name "证件照批量换底色工具-Czq" `
             --collect-all rembg `
             --collect-all onnxruntime `
             --collect-all tkinterdnd2 `
@@ -42,5 +42,5 @@ jobs:
       - name: 6. 上传打包好的软件压缩包
         uses: actions/upload-artifact@v4
         with:
-          name: 证件照批量换底色工具-Windows版
+          name: 证件照批量换底色工具-Czq
           path: dist/证件照批量换底色工具/
