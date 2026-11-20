@@ -7,13 +7,19 @@
 import os
 import sys
 import io
-# 1. 修复 PyInstaller --windowed 模式下 sys.stdout / sys.stderr 为 None 导致 rembg 进度条报错
+import threading
+import queue
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, colorchooser, messagebox
+
+# 修复 PyInstaller --windowed 模式下 sys.stdout / sys.stderr 为 None 导致进度条库报错
 if sys.stdout is None:
     sys.stdout = io.StringIO()
 if sys.stderr is None:
     sys.stderr = io.StringIO()
 
-# 2. 兼容 PyInstaller 6.x (_internal\.u2net) 与同级目录的离线模型路径
+# 兼容 PyInstaller 6.x (_internal\.u2net) 与同级目录的离线模型路径
 if getattr(sys, "frozen", False):
     exe_dir = Path(sys.executable).resolve().parent
     internal_u2net = exe_dir / "_internal" / ".u2net"
@@ -22,26 +28,9 @@ if getattr(sys, "frozen", False):
         os.environ["U2NET_HOME"] = str(internal_u2net)
     elif local_u2net.exists():
         os.environ["U2NET_HOME"] = str(local_u2net)
-import threading
-import queue
-import io
-from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, filedialog, colorchooser, messagebox
 
 from PIL import Image, ImageOps
-import sys
 
-def _get_model_dir():
-    if getattr(sys, "frozen", False):
-        base = Path(sys.executable).resolve().parent
-    else:
-        base = Path(__file__).resolve().parent
-    model_dir = base / ".u2net"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    return str(model_dir)
-
-os.environ.setdefault("U2NET_HOME", _get_model_dir())
 try:
     from rembg import remove, new_session
 except Exception:
