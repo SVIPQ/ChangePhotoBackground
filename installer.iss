@@ -13,4 +13,4 @@ ArchitecturesInstallIn64BitMode=x64compatible
 Source: "dist\证件照批量换底色工具\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autodesktop}\证件照批量换底色工具-Czq"; Filename: "{app}\证件照批量换底色工具-Czq.exe"; IconFilename: "{app}\证件照批量换底色工具-Czq.exe"
+Name: "{autodesktop}\证件照批量换底色工具"; Filename: "{app}\证件照批量换底色工具.exe"; IconFilename: "{app}\证件照批量换底色工具.exe"
