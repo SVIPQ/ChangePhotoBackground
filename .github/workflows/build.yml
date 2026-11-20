@@ -52,36 +52,10 @@ jobs:
             --collect-all onnxruntime `
             $entryScript.FullName
 
-      - name: 7. 安装 Inno Setup、准备简体中文语言包并编译安装程序 EXE
+      - name: 7. 安装 Inno Setup 并编译安装程序 EXE
         shell: pwsh
         run: |
           choco install innosetup -y
-          $langDir = "C:\Program Files (x86)\Inno Setup 6\Languages"
-          $langFile = Join-Path $langDir "ChineseSimplified.isl"
-          New-Item -ItemType Directory -Force -Path $langDir | Out-Null
-
-          if (-not (Test-Path $langFile)) {
-            $urls = @(
-              "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/ChineseSimplified.isl",
-              "https://cdn.jsdelivr.net/gh/jrsoftware/issrc@main/Files/Languages/Unofficial/ChineseSimplified.isl"
-            )
-            $downloaded = $false
-            foreach ($u in $urls) {
-              try {
-                Invoke-WebRequest -Uri $u -OutFile $langFile -UseBasicParsing -TimeoutSec 30
-                if ((Test-Path $langFile) -and ((Get-Item $langFile).Length -gt 1024)) {
-                  $downloaded = $true
-                  break
-                }
-              } catch {
-                Write-Host "下载失败，尝试下一个源: $u -> $_"
-              }
-            }
-            if (-not $downloaded) {
-              throw "无法下载 ChineseSimplified.isl，请检查网络或将该文件提交到仓库根目录。"
-            }
-          }
-
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer.iss"
 
       - name: 8. 上传最终安装程序
