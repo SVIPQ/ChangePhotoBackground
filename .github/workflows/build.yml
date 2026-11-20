@@ -37,7 +37,7 @@ jobs:
             python -c "from PIL import Image; img = Image.new('RGBA', (256, 256), (37, 99, 235, 255)); img.save('app.ico', format='ICO', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])"
           }
 
-      - name: 6. 打包程序根目录（含自定义图标与离线模型）
+      - name: 6. 打包程序根目录（含自定义图标、离线模型与包元数据）
         shell: pwsh
         run: |
           $entryScript = Get-ChildItem -Filter "*.py" | Where-Object { $_.Name -notlike "test*" } | Select-Object -First 1
@@ -48,6 +48,10 @@ jobs:
             --name "证件照批量换底色工具_Czq" `
             --icon "app.ico" `
             --add-data ".u2net;.u2net" `
+            --copy-metadata pymatting `
+            --copy-metadata rembg `
+            --copy-metadata onnxruntime `
+            --copy-metadata pillow `
             --collect-all rembg `
             --collect-all onnxruntime `
             $entryScript.FullName
