@@ -1,5 +1,3 @@
-# ChangePhotoBackground
-ChangePhotoBackground
 # 证件照批量换底色工具（Windows）
 
 ## 功能
