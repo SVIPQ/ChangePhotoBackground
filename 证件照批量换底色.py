@@ -286,3 +286,470 @@ class App:
             "Subtitle.TLabel",
             background=THEME["bg"],
             foreground=THEME["muted"],
+            font=("Microsoft YaHei UI", 9),
+        )
+        style.configure(
+            "CardTitle.TLabel",
+            background=THEME["card"],
+            foreground=THEME["text"],
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        style.configure(
+            "CardText.TLabel",
+            background=THEME["card"],
+            foreground=THEME["text"],
+            font=("Microsoft YaHei UI", 9),
+        )
+        style.configure(
+            "MutedCard.TLabel",
+            background=THEME["card"],
+            foreground=THEME["muted"],
+            font=("Microsoft YaHei UI", 8),
+        )
+        style.configure(
+            "Status.TLabel",
+            background=THEME["bg"],
+            foreground=THEME["muted"],
+            font=("Microsoft YaHei UI", 9),
+        )
+        style.configure(
+            "Action.TButton",
+            font=("Microsoft YaHei UI", 9),
+            padding=(10, 4),
+        )
+        style.configure(
+            "Primary.TButton",
+            font=("Microsoft YaHei UI", 11, "bold"),
+            foreground="#FFFFFF",
+            background=THEME["accent"],
+            padding=(18, 9),
+        )
+        style.map(
+            "Primary.TButton",
+            background=[("active", THEME["accent_hover"]), ("disabled", "#93C5FD")],
+            foreground=[("disabled", "#F8FAFC")],
+        )
+        style.configure(
+            "Blue.Horizontal.TProgressbar",
+            troughcolor="#E2E8F0",
+            background=THEME["accent"],
+            thickness=8,
+        )
+
+    def _make_card(self, parent, pady=(0, 8)):
+        outer = tk.Frame(
+            parent,
+            bg=THEME["card"],
+            highlightbackground=THEME["border"],
+            highlightthickness=1,
+        )
+        outer.pack(fill="x", padx=16, pady=pady)
+        inner = ttk.Frame(outer, style="Card.TFrame")
+        inner.pack(fill="both", expand=True, padx=12, pady=8)
+        return outer, inner
+
+    def _build(self):
+        header = ttk.Frame(self.root, style="App.TFrame")
+        header.pack(fill="x", padx=16, pady=(12, 6))
+        ttk.Label(header, text=APP_DISPLAY_NAME, style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text="AI 智能抠图 · 统一底色 · 保留子文件夹层级与文件名 · 支持 JPG / PNG 导出",
+            style="Subtitle.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+
+        _, import_card = self._make_card(self.root, pady=(0, 8))
+
+        self.drop = tk.Label(
+            import_card,
+            text="点击下方“添加照片”或“添加文件夹”选择待处理图片\n支持整批照片、总文件夹及多层子文件夹递归扫描",
+            relief="flat",
+            bg=THEME["drop_bg"],
+            fg=THEME["drop_fg"],
+            font=("Microsoft YaHei UI", 10, "bold"),
+            height=3,
+            highlightbackground=THEME["drop_border"],
+            highlightthickness=1,
+        )
+        self.drop.pack(fill="x", pady=(0, 6))
+
+        btn_row = ttk.Frame(import_card, style="Card.TFrame")
+        btn_row.pack(fill="x", pady=(0, 6))
+        ttk.Button(btn_row, text="添加照片", style="Action.TButton", command=self.add_files).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_row, text="添加文件夹", style="Action.TButton", command=self.add_folder).pack(side="left")
+        ttk.Button(btn_row, text="清空", style="Action.TButton", command=self.clear).pack(side="right")
+
+        list_wrap = tk.Frame(
+            import_card,
+            bg=THEME["list_bg"],
+            highlightbackground=THEME["border"],
+            highlightthickness=1,
+        )
+        list_wrap.pack(fill="x")
+        self.listbox = tk.Listbox(
+            list_wrap,
+            height=4,
+            bg=THEME["list_bg"],
+            fg=THEME["text"],
+            selectbackground=THEME["accent"],
+            selectforeground="#FFFFFF",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self.listbox.pack(fill="x", padx=6, pady=4)
+
+        _, set_card = self._make_card(self.root, pady=(0, 8))
+        ttk.Label(set_card, text="处理参数设置", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 6))
+
+        r1 = ttk.Frame(set_card, style="Card.TFrame")
+        r1.pack(fill="x", pady=(0, 6))
+        ttk.Label(r1, text="背景颜色：", style="CardText.TLabel").pack(side="left")
+        self.preset = ttk.Combobox(
+            r1,
+            values=list(PRESETS.keys()) + ["自定义颜色"],
+            state="readonly",
+            width=14,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self.preset.set("蓝色（常用）")
+        self.preset.pack(side="left", padx=(4, 8))
+        self.preset.bind("<<ComboboxSelected>>", self._preset_changed)
+
+        self.color_swatch = tk.Label(
+            r1,
+            text="    ",
+            bg=self.color.get(),
+            relief="solid",
+            bd=1,
+        )
+        self.color_swatch.pack(side="left", padx=(0, 6))
+        self.hex_label = ttk.Label(r1, text=self.color.get(), style="CardText.TLabel")
+        self.hex_label.pack(side="left", padx=(0, 8))
+        ttk.Button(r1, text="自定义颜色", style="Action.TButton", command=self.choose_color).pack(side="right")
+
+        r2 = ttk.Frame(set_card, style="Card.TFrame")
+        r2.pack(fill="x")
+        ttk.Label(r2, text="输出格式：", style="CardText.TLabel").pack(side="left")
+        self.format_combo = ttk.Combobox(
+            r2,
+            textvariable=self.output_format,
+            values=["JPG", "PNG"],
+            state="readonly",
+            width=7,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self.format_combo.pack(side="left", padx=(4, 12))
+
+        ttk.Label(r2, text="大小上限：", style="CardText.TLabel").pack(side="left")
+        ttk.Spinbox(
+            r2,
+            from_=10,
+            to=2000,
+            textvariable=self.max_kb,
+            width=6,
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side="left", padx=(4, 6))
+        ttk.Label(r2, text="KB（超限时尝试降质/缩放）", style="MutedCard.TLabel").pack(side="left")
+
+        _, dir_card = self._make_card(self.root, pady=(0, 10))
+        ttk.Label(dir_card, text="输出文件夹", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 4))
+
+        r3 = ttk.Frame(dir_card, style="Card.TFrame")
+        r3.pack(fill="x", pady=(0, 8))
+        self.out_entry = ttk.Entry(r3, textvariable=self.output_dir, font=("Microsoft YaHei UI", 9))
+        self.out_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(r3, text="浏览", style="Action.TButton", command=self.choose_output).pack(side="right")
+
+        ttk.Label(
+            dir_card,
+            text="AI 模型存放位置（可鼠标点选目录，也可直接键盘输入/粘贴路径，建议选非 C 盘）：",
+            style="CardTitle.TLabel",
+        ).pack(anchor="w", pady=(0, 4))
+
+        r4 = ttk.Frame(dir_card, style="Card.TFrame")
+        r4.pack(fill="x")
+        self.model_entry = ttk.Entry(r4, textvariable=self.model_dir, font=("Microsoft YaHei UI", 9))
+        self.model_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.model_entry.bind("<Return>", self._on_model_entry_confirm)
+        self.model_entry.bind("<FocusOut>", self._on_model_entry_confirm)
+        ttk.Button(r4, text="选择目录", style="Action.TButton", command=self.choose_model_dir).pack(side="right")
+
+        bottom = ttk.Frame(self.root, style="App.TFrame")
+        bottom.pack(fill="x", padx=16, pady=(0, 10))
+
+        self.progress = ttk.Progressbar(
+            bottom,
+            mode="determinate",
+            style="Blue.Horizontal.TProgressbar",
+        )
+        self.progress.pack(fill="x", pady=(0, 4))
+        ttk.Label(bottom, textvariable=self.status, style="Status.TLabel").pack(anchor="w", pady=(0, 8))
+
+        self.start_btn = ttk.Button(
+            bottom,
+            text="开始批量处理",
+            style="Primary.TButton",
+            command=self.start,
+        )
+        self.start_btn.pack(fill="x", ipady=2)
+
+        ttk.Label(
+            bottom,
+            text="提示：支持选择导出 JPG 或 PNG；自动保留原文件主名称与目录结构，原图不会被修改。",
+            style="Subtitle.TLabel",
+            wraplength=580,
+        ).pack(anchor="w", pady=(6, 0))
+
+    def _add_paths(self, paths):
+        valid = [p for p in paths if Path(p).exists()]
+        self.input_paths.extend(valid)
+        images = collect_images(self.input_paths)
+        self.listbox.delete(0, tk.END)
+        for p in images[:1000]:
+            self.listbox.insert(tk.END, str(p))
+        self.status.set(f"已找到 {len(images)} 张图片")
+        self._images = images
+
+    def add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="选择照片",
+            filetypes=[("图片", "*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff"), ("所有文件", "*.*")],
+        )
+        if paths:
+            self._add_paths(paths)
+
+    def add_folder(self):
+        p = filedialog.askdirectory(title="选择包含照片的总文件夹")
+        if p:
+            self._add_paths([p])
+
+    def clear(self):
+        self.input_paths = []
+        self._images = []
+        self.listbox.delete(0, tk.END)
+        self.status.set("列表已清空")
+
+    def choose_output(self):
+        p = filedialog.askdirectory(title="选择输出文件夹")
+        if p:
+            self.output_dir.set(p)
+
+    def choose_model_dir(self):
+        initial = self.model_dir.get().strip()
+        init_path = Path(initial).expanduser()
+        while init_path != init_path.parent and not init_path.exists():
+            init_path = init_path.parent
+        p = filedialog.askdirectory(
+            title="选择存放 AI 抠图模型的文件夹（支持逐级点击选择，建议选非 C 盘）",
+            initialdir=str(init_path) if init_path.exists() else None,
+        )
+        if p:
+            self.model_dir.set(p)
+            self.status.set(f"已选择模型目录：{p}")
+
+    def _on_model_entry_confirm(self, _=None):
+        typed = self.model_dir.get().strip()
+        if typed:
+            normalized = str(Path(typed).expanduser())
+            self.model_dir.set(normalized)
+
+    def _preset_changed(self, _=None):
+        name = self.preset.get()
+        if name in PRESETS:
+            self._set_color(PRESETS[name])
+        elif name == "自定义颜色":
+            self.choose_color()
+
+    def choose_color(self):
+        result = colorchooser.askcolor(color=self.color.get(), title="选择证件照背景颜色")
+        if result and result[1]:
+            self._set_color(result[1])
+
+    def _set_color(self, value):
+        self.color.set(value.upper())
+        self.color_swatch.configure(bg=value)
+        self.hex_label.configure(text=value.upper())
+        if value.upper() not in {v.upper() for v in PRESETS.values()}:
+            self.preset.set("自定义颜色")
+
+    def start(self):
+        images = getattr(self, "_images", [])
+        if not images:
+            messagebox.showwarning("提示", "请先添加照片或文件夹。")
+            return
+        out = Path(self.output_dir.get().strip())
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("输出目录错误", str(e))
+            return
+        try:
+            rgb = hex_to_rgb(self.color.get())
+        except Exception as e:
+            messagebox.showerror("颜色设置错误", str(e))
+            return
+
+        chosen_model_str = self.model_dir.get().strip()
+        if not chosen_model_str:
+            messagebox.showwarning("提示", "请输入或选择一个 AI 模型存放目录。")
+            return
+
+        fmt = (self.output_format.get() or "JPG").upper()
+        self.start_btn.configure(state="disabled")
+        self.progress.configure(maximum=len(images), value=0)
+        threading.Thread(
+            target=self._worker,
+            args=(images, out, rgb, fmt, self.max_kb.get(), chosen_model_str),
+            daemon=True,
+        ).start()
+
+    def _worker(self, images, out, rgb, fmt, max_kb, chosen_model_str):
+        if remove is None or new_session is None:
+            self.msgq.put(("fatal", "缺少 rembg 组件，请检查打包是否完整。"))
+            return
+        try:
+            prepare_model_directory(
+                chosen_model_str,
+                status_cb=lambda text: self.msgq.put(("status", text)),
+            )
+            self.msgq.put(("status", "正在加载 AI 抠图模型……"))
+            session = new_session("u2net")
+        except Exception as e:
+            self.msgq.put(("fatal", f"AI 模型加载失败：{e}"))
+            return
+
+        roots = [Path(p) for p in self.input_paths if Path(p).is_dir()]
+        root_for = {}
+        for f in images:
+            candidates = [r for r in roots if r == f or r in f.parents]
+            root_for[f] = max(candidates, key=lambda x: len(x.parts)) if candidates else f.parent
+
+        ext = ".png" if fmt == "PNG" else ".jpg"
+        ok = 0
+        errors = []
+        for idx, src in enumerate(images, 1):
+            try:
+                with Image.open(src) as im:
+                    im = ImageOps.exif_transpose(im).convert("RGBA")
+                    cut = remove(im, session=session)
+                    if not isinstance(cut, Image.Image):
+                        cut = Image.open(io.BytesIO(cut)).convert("RGBA")
+                    else:
+                        cut = cut.convert("RGBA")
+                bg = Image.new("RGBA", cut.size, (*rgb, 255))
+                bg.alpha_composite(cut)
+                result = bg.convert("RGB")
+
+                root = root_for[src]
+                try:
+                    relative = src.relative_to(root)
+                except ValueError:
+                    relative = Path(src.name)
+                target_dir = out / (relative.parent if root.is_dir() else Path())
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target = target_dir / (src.stem + ext)
+                if target.exists() and src.suffix.lower() != ext:
+                    target = target_dir / (src.stem + f"_converted{ext}")
+                data = encode_image_under_limit(result, fmt, max_kb)
+                target.write_bytes(data)
+                ok += 1
+                self.msgq.put(("progress", idx, len(images), f"处理中 {idx}/{len(images)}：{src.name}"))
+            except Exception as e:
+                errors.append(f"{src}: {e}")
+                self.msgq.put(("progress", idx, len(images), f"失败 {idx}/{len(images)}：{src.name}"))
+        self.msgq.put(("done", ok, len(images), errors, str(out)))
+
+    def _poll(self):
+        try:
+            while True:
+                item = self.msgq.get_nowait()
+                kind = item[0]
+                if kind == "status":
+                    self.status.set(item[1])
+                elif kind == "progress":
+                    _, v, total, msg = item
+                    self.progress.configure(value=v)
+                    self.status.set(msg)
+                elif kind == "fatal":
+                    self.start_btn.configure(state="normal")
+                    messagebox.showerror("无法处理", item[1])
+                elif kind == "done":
+                    _, ok, total, errors, out = item
+                    self.start_btn.configure(state="normal")
+                    self.status.set(f"完成：成功 {ok} 张，失败 {len(errors)} 张")
+                    msg = f"处理完成！\n成功：{ok}/{total} 张\n输出位置：{out}"
+                    if errors:
+                        msg += "\n\n部分失败原因（最多显示 5 条）：\n" + "\n".join(errors[:5])
+                    messagebox.showinfo("处理完成", msg)
+        except queue.Empty:
+            pass
+        self.root.after(150, self._poll)
+
+
+def main():
+    global Image, ImageOps, remove, new_session, TkinterDnD, DND_FILES
+
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        splash = LoadingWindow(root)
+        load_q = queue.Queue()
+
+        def load_deps():
+            global Image, ImageOps, remove, new_session, TkinterDnD, DND_FILES
+            try:
+                load_q.put((25, "正在加载图像处理组件 (Pillow)..."))
+                from PIL import Image as _Image, ImageOps as _ImageOps
+                Image, ImageOps = _Image, _ImageOps
+
+                load_q.put((60, "正在加载 AI 抠图引擎 (rembg / onnxruntime)..."))
+                from rembg import remove as _remove, new_session as _new_session
+                remove, new_session = _remove, _new_session
+
+                TkinterDnD, DND_FILES = None, None
+
+                load_q.put((100, "加载完成，正在打开主界面..."))
+                load_q.put(("DONE", None))
+            except Exception as e:
+                load_q.put(("ERROR", str(e)))
+
+        def finish_load(err_msg=None):
+            splash.close()
+            if err_msg:
+                messagebox.showerror("启动失败", f"组件加载出错：\n{err_msg}")
+                root.destroy()
+                return
+            root.deiconify()
+            App(root)
+
+        def poll_load():
+            try:
+                while True:
+                    step, payload = load_q.get_nowait()
+                    if step == "DONE":
+                        finish_load(None)
+                        return
+                    elif step == "ERROR":
+                        finish_load(payload)
+                        return
+                    else:
+                        splash.update_progress(step, payload)
+            except queue.Empty:
+                pass
+            if root.winfo_exists():
+                root.after(80, poll_load)
+
+        threading.Thread(target=load_deps, daemon=True).start()
+        root.after(80, poll_load)
+        root.mainloop()
+    except Exception as e:
+        try:
+            messagebox.showerror("启动异常", f"程序启动出错：\n{e}")
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
