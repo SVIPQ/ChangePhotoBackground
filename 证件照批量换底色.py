@@ -13,7 +13,18 @@ import tkinter as tk
 from tkinter import ttk, filedialog, colorchooser, messagebox
 
 from PIL import Image, ImageOps
+import sys
 
+def _get_model_dir():
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).resolve().parent
+    else:
+        base = Path(__file__).resolve().parent
+    model_dir = base / ".u2net"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    return str(model_dir)
+
+os.environ.setdefault("U2NET_HOME", _get_model_dir())
 try:
     from rembg import remove, new_session
 except Exception:
