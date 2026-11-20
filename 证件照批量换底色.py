@@ -79,11 +79,9 @@ PRESETS = {
     "灰色": "#D9D9D9",
 }
 
-# 白蓝清爽配色 + 高圆润模块层次
 THEME = {
     "bg": "#F2F6FC",
     "card": "#FFFFFF",
-    "card_soft": "#F8FAFC",
     "border": "#D8E3F0",
     "text": "#0F172A",
     "muted": "#64748B",
@@ -196,8 +194,7 @@ def prepare_model_directory(target_dir_str, status_cb=None):
     return target_dir
 
 
-def _rounded_rect_points(x1, y1, x2, y2, r, segments=20):
-    """高密度角采样生成顺滑圆角/胶囊矩形顶点"""
+def _rounded_rect_points(x1, y1, x2, y2, r, segments=18):
     r = max(0, min(r, (x2 - x1) / 2.0, (y2 - y1) / 2.0))
     if r <= 0:
         return [x1, y1, x2, y1, x2, y2, x1, y2]
@@ -216,66 +213,21 @@ def _rounded_rect_points(x1, y1, x2, y2, r, segments=20):
     return pts
 
 
-def create_rounded_rect(canvas, x1, y1, x2, y2, r=18, **kwargs):
-    pts = _rounded_rect_points(x1, y1, x2, y2, r=r, segments=20)
+def create_rounded_rect(canvas, x1, y1, x2, y2, r=16, **kwargs):
+    pts = _rounded_rect_points(x1, y1, x2, y2, r=r, segments=18)
     return canvas.create_polygon(pts, smooth=False, **kwargs)
 
 
-class RoundedCard(tk.Canvas):
-    """高圆润模块卡片容器"""
-    def __init__(self, parent, bg_color="#F2F6FC", card_bg="#FFFFFF", border_color="#D8E3F0", radius=22, **kwargs):
-        super().__init__(parent, bg=bg_color, highlightthickness=0, bd=0, **kwargs)
-        self.card_bg = card_bg
-        self.border_color = border_color
-        self.radius = radius
-        self.inner = tk.Frame(self, bg=card_bg, bd=0, highlightthickness=0)
-        self._win_id = self.create_window(14, 12, window=self.inner, anchor="nw")
-        self.bind("<Configure>", self._on_resize)
-        self.inner.bind("<Configure>", self._on_inner_resize)
-
-    def _on_inner_resize(self, _event=None):
-        req_w = self.inner.winfo_reqwidth()
-        req_h = self.inner.winfo_reqheight()
-        target_h = req_h + 24
-        if int(float(self.cget("height") or 0)) != target_h:
-            self.configure(height=target_h)
-        cur_w = max(self.winfo_width(), req_w + 28)
-        self.itemconfigure(self._win_id, width=max(10, cur_w - 28))
-        self._redraw(cur_w, target_h)
-
-    def _on_resize(self, event):
-        w = max(40, event.width)
-        h = max(40, event.height)
-        self.itemconfigure(self._win_id, width=max(10, w - 28))
-        self._redraw(w, h)
-
-    def _redraw(self, w, h):
-        self.delete("card_bg")
-        create_rounded_rect(
-            self,
-            1,
-            1,
-            w - 1,
-            h - 1,
-            r=self.radius,
-            fill=self.card_bg,
-            outline=self.border_color,
-            width=1.4,
-            tags="card_bg",
-        )
-        self.tag_lower("card_bg")
-
-
 class SmoothAnimatedButton(tk.Canvas):
-    """圆润胶囊按钮：支持弹性缩放回弹、悬停呼吸与多层扩散波动动画"""
+    """圆润胶囊按钮：支持弹性缩放回弹、悬停变色与扩散波动动画"""
     def __init__(
         self,
         parent,
         text,
         command=None,
         width=120,
-        height=34,
-        radius=17,
+        height=32,
+        radius=16,
         bg_color="#EBF2FF",
         hover_color="#DBEAFE",
         fg_color="#1E3A8A",
@@ -305,12 +257,11 @@ class SmoothAnimatedButton(tk.Canvas):
         self.enabled = True
         self._hovered = False
 
-        # 回弹与波动动画状态
         self._scale = 1.0
         self._vel = 0.0
         self._spring_job = None
         self._wave_job = None
-        self._waves = []  # [cx, cy, radius_val, max_r, tick]
+        self._waves = []
 
         self.bind("<Configure>", self._on_resize)
         self.bind("<Enter>", self._on_enter)
@@ -334,7 +285,7 @@ class SmoothAnimatedButton(tk.Canvas):
         if not self.enabled:
             return
         self._hovered = True
-        self._animate_spring(target_scale=1.025)
+        self._animate_spring(target_scale=1.02)
         self._render()
 
     def _on_leave(self, _event):
@@ -345,10 +296,9 @@ class SmoothAnimatedButton(tk.Canvas):
     def _on_press(self, event):
         if not self.enabled:
             return
-        self._scale = 0.93
+        self._scale = 0.94
         self._vel = 0.0
         max_r = max(self._w, self._h) * 0.85
-        # 触发双层波动圈，模拟涟漪扩散感
         self._waves.append([event.x, event.y, 5.0, max_r, 0])
         self._waves.append([event.x, event.y, 1.0, max_r * 0.72, -3])
         self._start_wave_loop()
@@ -357,11 +307,11 @@ class SmoothAnimatedButton(tk.Canvas):
     def _on_release(self, event):
         if not self.enabled:
             return
-        self._vel = 0.038
-        self._animate_spring(target_scale=1.035 if self._hovered else 1.0)
+        self._vel = 0.036
+        self._animate_spring(target_scale=1.03 if self._hovered else 1.0)
         inside = (0 <= event.x <= self._w) and (0 <= event.y <= self._h)
         if inside and callable(self.command):
-            self.after(70, self.command)
+            self.after(65, self.command)
 
     def _animate_spring(self, target_scale):
         if self._spring_job is not None:
@@ -443,7 +393,7 @@ class SmoothAnimatedButton(tk.Canvas):
             if tick < 0:
                 continue
             progress = r_val / max(1.0, max_r)
-            ring_w = max(1.0, 2.6 * (1.0 - progress))
+            ring_w = max(1.0, 2.5 * (1.0 - progress))
             create_rounded_rect(
                 self,
                 max(x1 + 1, cx - r_val * 1.35),
@@ -460,19 +410,18 @@ class SmoothAnimatedButton(tk.Canvas):
 
 
 class PillToggle(tk.Canvas):
-    """胶囊滑动开关组件（用于精细边缘模式，视觉更圆润现代）"""
-    def __init__(self, parent, variable, text, parent_bg="#FFFFFF"):
+    """胶囊滑动开关组件"""
+    def __init__(self, parent, variable, parent_bg="#FFFFFF"):
         super().__init__(
             parent,
-            width=52,
-            height=26,
+            width=48,
+            height=24,
             bg=parent_bg,
             highlightthickness=0,
             bd=0,
             cursor="hand2",
         )
         self.variable = variable
-        self.text = text
         self._pos = 1.0 if bool(variable.get()) else 0.0
         self._job = None
         self.bind("<Button-1>", self._toggle)
@@ -509,9 +458,9 @@ class PillToggle(tk.Canvas):
         self.delete("all")
         active = bool(self.variable.get()) or self._pos > 0.5
         track_fill = THEME["accent"] if active else "#CBD5E1"
-        create_rounded_rect(self, 2, 2, 50, 24, r=11, fill=track_fill, outline="", width=0)
-        knob_x = 4 + self._pos * 24
-        create_rounded_rect(self, knob_x, 4, knob_x + 20, 22, r=9, fill="#FFFFFF", outline="", width=0)
+        create_rounded_rect(self, 2, 2, 46, 22, r=10, fill=track_fill, outline="", width=0)
+        knob_x = 4 + self._pos * 22
+        create_rounded_rect(self, knob_x, 4, knob_x + 18, 20, r=8, fill="#FFFFFF", outline="", width=0)
 
 
 class LoadingWindow:
@@ -526,7 +475,7 @@ class LoadingWindow:
 
         canvas = tk.Canvas(self.win, width=420, height=168, bg="#F2F6FC", highlightthickness=0, bd=0)
         canvas.pack(fill="both", expand=True)
-        create_rounded_rect(canvas, 3, 3, 417, 165, r=22, fill="#FFFFFF", outline="#2563EB", width=2)
+        create_rounded_rect(canvas, 3, 3, 417, 165, r=20, fill="#FFFFFF", outline="#2563EB", width=2)
 
         canvas.create_text(210, 38, text=SPLASH_DISPLAY_NAME, fill="#0F172A", font=("Microsoft YaHei UI", 12, "bold"))
         self.status_var = tk.StringVar(value="正在初始化程序环境，请稍候...")
@@ -575,7 +524,7 @@ class App:
         self.root = root
         self.root.title(APP_DISPLAY_NAME)
         self.root.geometry("620x780")
-        self.root.minsize(560, 680)
+        self.root.minsize(560, 720)
         self.root.configure(bg=THEME["bg"])
 
         default_model_path = (
@@ -607,7 +556,6 @@ class App:
             pass
 
         style.configure("App.TFrame", background=THEME["bg"])
-        style.configure("Card.TFrame", background=THEME["card"])
         style.configure(
             "Title.TLabel",
             background=THEME["bg"],
@@ -648,23 +596,27 @@ class App:
             "Blue.Horizontal.TProgressbar",
             troughcolor="#E2E8F0",
             background=THEME["accent"],
-            thickness=9,
+            thickness=8,
         )
 
-    def _make_card(self, parent, pady=(0, 8), radius=22):
-        card = RoundedCard(
+    def _make_card(self, parent, pady=(0, 8)):
+        """稳定的卡片容器：外层浅蓝圆角边框 + 内层白底 Frame，高度由子控件自然撑开"""
+        border_box = tk.Frame(parent, bg=THEME["border"], bd=0, highlightthickness=0)
+        border_box.pack(fill="x", padx=16, pady=pady)
+        inner = tk.Frame(border_box, bg=THEME["card"], bd=0, highlightthickness=0)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        pad_box = tk.Frame(inner, bg=THEME["card"], bd=0, highlightthickness=0)
+        pad_box.pack(fill="both", expand=True, padx=12, pady=9)
+        return pad_box
+
+    def _make_rounded_entry_box(self, parent, textvariable, on_confirm=None):
+        wrap = tk.Frame(
             parent,
-            bg_color=THEME["bg"],
-            card_bg=THEME["card"],
-            border_color=THEME["border"],
-            radius=radius,
-            height=100,
+            bg="#F8FAFC",
+            highlightbackground=THEME["border"],
+            highlightthickness=1,
+            bd=0,
         )
-        card.pack(fill="x", padx=16, pady=pady)
-        return card, card.inner
-
-    def _make_rounded_entry_box(self, parent, textvariable, on_confirm=None, radius=15):
-        wrap = tk.Canvas(parent, height=34, bg=THEME["card"], highlightthickness=0, bd=0)
         entry = tk.Entry(
             wrap,
             textvariable=textvariable,
@@ -676,34 +628,13 @@ class App:
             highlightthickness=0,
             insertbackground=THEME["accent"],
         )
-        win_id = wrap.create_window(12, 6, window=entry, anchor="nw")
-
-        def redraw(_e=None):
-            w = max(40, wrap.winfo_width())
-            h = max(24, wrap.winfo_height())
-            wrap.delete("box_bg")
-            create_rounded_rect(
-                wrap,
-                1,
-                1,
-                w - 1,
-                h - 1,
-                r=radius,
-                fill="#F8FAFC",
-                outline=THEME["border"],
-                width=1.3,
-                tags="box_bg",
-            )
-            wrap.tag_lower("box_bg")
-            wrap.itemconfigure(win_id, width=max(20, w - 24), height=max(16, h - 12))
-
-        wrap.bind("<Configure>", redraw)
+        entry.pack(fill="x", expand=True, padx=8, pady=6)
         if callable(on_confirm):
             entry.bind("<Return>", on_confirm)
             entry.bind("<FocusOut>", on_confirm)
         return wrap, entry
 
-    def _make_sec_btn(self, parent, text, command, width=96, height=32):
+    def _make_sec_btn(self, parent, text, command, width=96, height=30):
         return SmoothAnimatedButton(
             parent,
             text=text,
@@ -720,6 +651,7 @@ class App:
         )
 
     def _build(self):
+        # 顶部标题区
         header = ttk.Frame(self.root, style="App.TFrame")
         header.pack(fill="x", padx=16, pady=(12, 6))
         ttk.Label(header, text=APP_DISPLAY_NAME, style="Title.TLabel").pack(anchor="w")
@@ -729,15 +661,15 @@ class App:
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
-        # 卡片 1：圆润导入区域 + 胶囊按钮 + 圆润列表框
-        _, import_card = self._make_card(self.root, pady=(0, 8), radius=22)
+        # 卡片 1：导入提示 + 圆角胶囊按钮 + 列表框
+        import_card = self._make_card(self.root, pady=(0, 8))
 
-        drop_canvas = tk.Canvas(import_card, height=64, bg=THEME["card"], highlightthickness=0, bd=0)
-        drop_canvas.pack(fill="x", pady=(0, 8))
+        drop_canvas = tk.Canvas(import_card, height=56, bg=THEME["card"], highlightthickness=0, bd=0)
+        drop_canvas.pack(fill="x", pady=(0, 6))
 
         def draw_drop(_e=None):
             w = max(60, drop_canvas.winfo_width())
-            h = max(44, drop_canvas.winfo_height())
+            h = max(40, drop_canvas.winfo_height())
             drop_canvas.delete("all")
             create_rounded_rect(
                 drop_canvas,
@@ -745,10 +677,10 @@ class App:
                 1,
                 w - 1,
                 h - 1,
-                r=18,
+                r=16,
                 fill=THEME["drop_bg"],
                 outline=THEME["drop_border"],
-                width=1.4,
+                width=1.3,
             )
             drop_canvas.create_text(
                 w / 2.0,
@@ -759,7 +691,7 @@ class App:
             )
             drop_canvas.create_text(
                 w / 2.0,
-                h / 2.0 + 11,
+                h / 2.0 + 10,
                 text="支持整批照片、总文件夹及多层子文件夹递归扫描",
                 fill="#3B82F6",
                 font=("Microsoft YaHei UI", 8),
@@ -768,15 +700,20 @@ class App:
         drop_canvas.bind("<Configure>", draw_drop)
 
         btn_row = tk.Frame(import_card, bg=THEME["card"])
-        btn_row.pack(fill="x", pady=(0, 8))
-        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=98, height=32).pack(side="left", padx=(0, 8))
-        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=110, height=32).pack(side="left")
-        self._make_sec_btn(btn_row, "清空", self.clear, width=78, height=32).pack(side="right")
+        btn_row.pack(fill="x", pady=(0, 6))
+        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=96, height=30).pack(side="left", padx=(0, 8))
+        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=108, height=30).pack(side="left")
+        self._make_sec_btn(btn_row, "清空", self.clear, width=76, height=30).pack(side="right")
 
-        list_canvas = tk.Canvas(import_card, height=84, bg=THEME["card"], highlightthickness=0, bd=0)
-        list_canvas.pack(fill="x")
+        list_wrap = tk.Frame(
+            import_card,
+            bg=THEME["list_bg"],
+            highlightbackground=THEME["border"],
+            highlightthickness=1,
+        )
+        list_wrap.pack(fill="x")
         self.listbox = tk.Listbox(
-            list_canvas,
+            list_wrap,
             height=4,
             bg=THEME["list_bg"],
             fg=THEME["text"],
@@ -787,31 +724,10 @@ class App:
             highlightthickness=0,
             font=("Microsoft YaHei UI", 9),
         )
-        list_win = list_canvas.create_window(12, 7, window=self.listbox, anchor="nw")
+        self.listbox.pack(fill="x", padx=8, pady=5)
 
-        def draw_list(_e=None):
-            w = max(60, list_canvas.winfo_width())
-            h = max(48, list_canvas.winfo_height())
-            list_canvas.delete("list_bg_shape")
-            create_rounded_rect(
-                list_canvas,
-                1,
-                1,
-                w - 1,
-                h - 1,
-                r=16,
-                fill=THEME["list_bg"],
-                outline=THEME["border"],
-                width=1.3,
-                tags="list_bg_shape",
-            )
-            list_canvas.tag_lower("list_bg_shape")
-            list_canvas.itemconfigure(list_win, width=max(20, w - 24), height=max(24, h - 14))
-
-        list_canvas.bind("<Configure>", draw_list)
-
-        # 卡片 2：颜色、格式、大小上限与胶囊滑动“精细边缘模式”
-        _, set_card = self._make_card(self.root, pady=(0, 8), radius=22)
+        # 卡片 2：背景颜色、输出格式、大小上限与精细边缘开关
+        set_card = self._make_card(self.root, pady=(0, 8))
         ttk.Label(set_card, text="处理参数设置", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 6))
 
         r1 = tk.Frame(set_card, bg=THEME["card"])
@@ -828,15 +744,15 @@ class App:
         self.preset.pack(side="left", padx=(4, 8))
         self.preset.bind("<<ComboboxSelected>>", self._preset_changed)
 
-        swatch_c = tk.Canvas(r1, width=26, height=24, bg=THEME["card"], highlightthickness=0, bd=0)
+        swatch_c = tk.Canvas(r1, width=26, height=22, bg=THEME["card"], highlightthickness=0, bd=0)
         swatch_c.pack(side="left", padx=(0, 6))
         self._swatch_id = create_rounded_rect(
             swatch_c,
             1,
             1,
             25,
-            23,
-            r=8,
+            21,
+            r=7,
             fill=self.color.get(),
             outline="#94A3B8",
             width=1,
@@ -845,10 +761,10 @@ class App:
 
         self.hex_label = ttk.Label(r1, text=self.color.get(), style="CardText.TLabel")
         self.hex_label.pack(side="left", padx=(0, 8))
-        self._make_sec_btn(r1, "自定义颜色", self.choose_color, width=104, height=30).pack(side="right")
+        self._make_sec_btn(r1, "自定义颜色", self.choose_color, width=102, height=28).pack(side="right")
 
         r2 = tk.Frame(set_card, bg=THEME["card"])
-        r2.pack(fill="x", pady=(0, 8))
+        r2.pack(fill="x", pady=(0, 7))
         ttk.Label(r2, text="输出格式：", style="CardText.TLabel").pack(side="left")
         self.format_combo = ttk.Combobox(
             r2,
@@ -873,7 +789,7 @@ class App:
 
         r_fine = tk.Frame(set_card, bg=THEME["card"])
         r_fine.pack(fill="x")
-        self.fine_toggle = PillToggle(r_fine, self.fine_edge, "精细边缘模式", parent_bg=THEME["card"])
+        self.fine_toggle = PillToggle(r_fine, self.fine_edge, parent_bg=THEME["card"])
         self.fine_toggle.pack(side="left", padx=(0, 8))
         lbl_fine = ttk.Label(
             r_fine,
@@ -884,16 +800,16 @@ class App:
         lbl_fine.pack(side="left")
         lbl_fine.bind("<Button-1>", lambda _e: self.fine_toggle._toggle())
 
-        # 卡片 3：输出目录（默认桌面 + 原目录）与自定义 AI 模型目录
-        _, dir_card = self._make_card(self.root, pady=(0, 8), radius=22)
+        # 卡片 3：输出目录与 AI 模型目录
+        dir_card = self._make_card(self.root, pady=(0, 8))
         ttk.Label(dir_card, text="输出文件夹（默认桌面，可点击“浏览”或“原目录”修改）", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 4))
 
         r3 = tk.Frame(dir_card, bg=THEME["card"])
-        r3.pack(fill="x", pady=(0, 8))
-        out_box, self.out_entry = self._make_rounded_entry_box(r3, self.output_dir, radius=15)
+        r3.pack(fill="x", pady=(0, 7))
+        out_box, self.out_entry = self._make_rounded_entry_box(r3, self.output_dir)
         out_box.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=76, height=32).pack(side="left", padx=(0, 6))
-        self._make_sec_btn(r3, "浏览", self.choose_output, width=70, height=32).pack(side="right")
+        self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=74, height=30).pack(side="left", padx=(0, 6))
+        self._make_sec_btn(r3, "浏览", self.choose_output, width=68, height=30).pack(side="right")
 
         ttk.Label(
             dir_card,
@@ -907,12 +823,11 @@ class App:
             r4,
             self.model_dir,
             on_confirm=self._on_model_entry_confirm,
-            radius=15,
         )
         model_box.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self._make_sec_btn(r4, "选择目录", self.choose_model_dir, width=94, height=32).pack(side="right")
+        self._make_sec_btn(r4, "选择目录", self.choose_model_dir, width=92, height=30).pack(side="right")
 
-        # 底部进度、胶囊回弹波动主按钮与说明
+        # 底部进度条 + 胶囊回弹波动主按钮 + 提示
         bottom = ttk.Frame(self.root, style="App.TFrame")
         bottom.pack(fill="x", padx=16, pady=(0, 10))
 
@@ -922,15 +837,15 @@ class App:
             style="Blue.Horizontal.TProgressbar",
         )
         self.progress.pack(fill="x", pady=(0, 4))
-        ttk.Label(bottom, textvariable=self.status, style="Status.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(bottom, textvariable=self.status, style="Status.TLabel").pack(anchor="w", pady=(0, 7))
 
         self.start_btn = SmoothAnimatedButton(
             bottom,
             text="开始批量处理",
             command=self.start,
             width=580,
-            height=48,
-            radius=24,
+            height=46,
+            radius=23,
             bg_color=THEME["accent"],
             hover_color=THEME["accent_hover"],
             fg_color="#FFFFFF",
