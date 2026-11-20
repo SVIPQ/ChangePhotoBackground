@@ -117,7 +117,6 @@ def encode_image_under_limit(image, fmt, max_kb):
             img = img.resize((max(1, int(w * 0.85)), max(1, int(h * 0.85))), Image.Resampling.LANCZOS)
         raise ValueError(f"PNG 在可接受的最低尺寸下仍无法压缩到 {max_kb}KB")
 
-    # 默认 JPG：先二分查找最高画质，必要时逐步缩小尺寸
     for _ in range(12):
         lo, hi = 25, 95
         best = None
@@ -225,13 +224,18 @@ class LoadingWindow:
         self.win.geometry(f"420x168+{x}+{y}")
 
     def update_progress(self, value, text):
-        self.bar["value"] = value
-        self.status_var.set(text)
-        self.win.update_idletasks()
+        try:
+            if self.win.winfo_exists():
+                self.bar["value"] = value
+                self.status_var.set(text)
+                self.win.update_idletasks()
+        except Exception:
+            pass
 
     def close(self):
         try:
-            self.win.destroy()
+            if self.win.winfo_exists():
+                self.win.destroy()
         except Exception:
             pass
 
@@ -256,3 +260,29 @@ class App:
         self.model_dir = tk.StringVar(value=default_model_path)
         self.color = tk.StringVar(value=PRESETS["蓝色（常用）"])
         self.output_format = tk.StringVar(value="JPG")
+        self.max_kb = tk.IntVar(value=50)
+        self.status = tk.StringVar(value="等待导入照片或文件夹")
+
+        self._setup_styles()
+        self._build()
+        self._poll()
+
+    def _setup_styles(self):
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure("App.TFrame", background=THEME["bg"])
+        style.configure("Card.TFrame", background=THEME["card"])
+        style.configure(
+            "Title.TLabel",
+            background=THEME["bg"],
+            foreground=THEME["text"],
+            font=("Microsoft YaHei UI", 16, "bold"),
+        )
+        style.configure(
+            "Subtitle.TLabel",
+            background=THEME["bg"],
+            foreground=THEME["muted"],
