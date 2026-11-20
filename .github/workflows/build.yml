@@ -38,7 +38,7 @@ jobs:
         run: |
           $env:U2NET_HOME = "$PWD\.u2net"
           pyinstaller --noconfirm --onedir --windowed `
-            --name "证件照批量换底色工具-Czq" `
+            --name "证件照批量换底色工具_Czq" `
             --icon="app.ico" `
             --collect-all rembg `
             --collect-all onnxruntime `
@@ -55,5 +55,5 @@ jobs:
       - name: 8. 上传最终安装程序
         uses: actions/upload-artifact@v4
         with:
-          name: 证件照批量换底色工具安装包-Czq
-          path: Output/证件照批量换底色工具_安装程序-Czq.exe
+          name: 证件照批量换底色工具_安装程序_Czq
+          path: Output/证件照批量换底色工具_安装程序_Czq.exe
