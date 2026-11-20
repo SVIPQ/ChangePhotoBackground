@@ -29,13 +29,13 @@ begin
   ModelDirPage := CreateInputDirPage(
     wpSelectDir,
     '选择 AI 模型存放位置',
-    '请选择 AI 抠图模型的存放文件夹（建议选择非 C 盘或桌面文件夹）',
+    '请选择 AI 抠图模型的存放文件夹（建议选择非 C 盘目录）',
     '安装完成后，程序将使用此处指定的目录存放或读取 AI 模型。点击“浏览”可逐级选择目录，也可直接输入路径。',
     False,
     ''
   );
   ModelDirPage.Add('');
-  ModelDirPage.Values[0] := ExpandConstant('{userdesktop}\证件照模型_.u2net');
+  ModelDirPage.Values[0] := 'D:\证件照模型\.u2net';
 end;
 
 procedure RegisterPreviousData(PreviousDataKey: Integer);
