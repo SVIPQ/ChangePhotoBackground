@@ -23,20 +23,22 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: 4. 预下载 AI 抠图模型（实现纯离线运行）
+      - name: 4. 预下载 AI 抠图模型
         run: |
+          $env:U2NET_HOME = "$PWD\.u2net"
           python -c "from rembg import new_session; new_session('u2net')"
+          Get-ChildItem "$env:U2NET_HOME"
 
-      - name: 5. 打包成 Windows 绿色免安装文件夹
+      - name: 5. 打包成 Windows 安装文件夹
         run: |
+          $env:U2NET_HOME = "$PWD\.u2net"
           pyinstaller --noconfirm --onedir --windowed `
             --name "证件照批量换底色工具" `
             --collect-all rembg `
             --collect-all onnxruntime `
             --collect-all tkinterdnd2 `
             --collect-all pymatting `
-            --collect-all pooch `
-            --add-data "$env:USERPROFILE\.u2net;.u2net" `
+            --add-data ".u2net;.u2net" `
             "证件照批量换底色.py"
 
       - name: 6. 上传打包好的软件压缩包
