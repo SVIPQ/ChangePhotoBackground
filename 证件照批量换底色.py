@@ -1,10 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-证件照批量换底色工具
+证件照批量换底色工具-Czq
 功能：批量导入图片/文件夹（递归扫描子文件夹）、AI抠图、统一替换底色、
 保留子文件夹结构和文件主名称、导出 JPG 并尽量压缩到指定 KB 以内。
 """
 import os
+import sys
+import io
+# 1. 修复 PyInstaller --windowed 模式下 sys.stdout / sys.stderr 为 None 导致 rembg 进度条报错
+if sys.stdout is None:
+    sys.stdout = io.StringIO()
+if sys.stderr is None:
+    sys.stderr = io.StringIO()
+
+# 2. 兼容 PyInstaller 6.x (_internal\.u2net) 与同级目录的离线模型路径
+if getattr(sys, "frozen", False):
+    exe_dir = Path(sys.executable).resolve().parent
+    internal_u2net = exe_dir / "_internal" / ".u2net"
+    local_u2net = exe_dir / ".u2net"
+    if internal_u2net.exists():
+        os.environ["U2NET_HOME"] = str(internal_u2net)
+    elif local_u2net.exists():
+        os.environ["U2NET_HOME"] = str(local_u2net)
 import threading
 import queue
 import io
