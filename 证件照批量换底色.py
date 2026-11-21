@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 证件照批量换底色工具_Czq
-功能：批量导入图片/文件夹（递归扫描子文件夹）、AI抠图、统一替换底色、
+功能：批量导入图片/文件夹（递归扫描子文件夹）、多线程并发 AI 抠图、统一替换底色、
 保留子文件夹结构和文件主名称、支持导出 JPG 或 PNG、支持自定义 AI 模型存放目录、
 支持精细边缘模式（加强头发丝细节）、白蓝圆润卡片与胶囊控件、点击回弹与波动动画。
 """
@@ -12,6 +12,7 @@ import math
 import shutil
 import threading
 import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, colorchooser, messagebox
@@ -226,8 +227,8 @@ class SmoothAnimatedButton(tk.Canvas):
         text,
         command=None,
         width=120,
-        height=32,
-        radius=16,
+        height=30,
+        radius=15,
         bg_color="#EBF2FF",
         hover_color="#DBEAFE",
         fg_color="#1E3A8A",
@@ -414,8 +415,8 @@ class PillToggle(tk.Canvas):
     def __init__(self, parent, variable, parent_bg="#FFFFFF"):
         super().__init__(
             parent,
-            width=48,
-            height=24,
+            width=46,
+            height=22,
             bg=parent_bg,
             highlightthickness=0,
             bd=0,
@@ -458,9 +459,9 @@ class PillToggle(tk.Canvas):
         self.delete("all")
         active = bool(self.variable.get()) or self._pos > 0.5
         track_fill = THEME["accent"] if active else "#CBD5E1"
-        create_rounded_rect(self, 2, 2, 46, 22, r=10, fill=track_fill, outline="", width=0)
-        knob_x = 4 + self._pos * 22
-        create_rounded_rect(self, knob_x, 4, knob_x + 18, 20, r=8, fill="#FFFFFF", outline="", width=0)
+        create_rounded_rect(self, 2, 2, 44, 20, r=9, fill=track_fill, outline="", width=0)
+        knob_x = 4 + self._pos * 20
+        create_rounded_rect(self, knob_x, 4, knob_x + 16, 18, r=7, fill="#FFFFFF", outline="", width=0)
 
 
 class LoadingWindow:
@@ -523,8 +524,8 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_DISPLAY_NAME)
-        self.root.geometry("620x780")
-        self.root.minsize(560, 720)
+        self.root.geometry("640x820")
+        self.root.minsize(580, 740)
         self.root.configure(bg=THEME["bg"])
 
         default_model_path = (
@@ -532,6 +533,8 @@ class App:
             or str(Path.home() / "Documents" / "证件照模型_.u2net")
         )
         default_output_path = str(Path.home() / "Desktop" / "证件照换底色结果")
+        cpu_count = os.cpu_count() or 4
+        default_threads = max(2, min(4, cpu_count // 2))
 
         self.msgq = queue.Queue()
         self.input_paths = []
@@ -541,6 +544,7 @@ class App:
         self.color = tk.StringVar(value=PRESETS["蓝色（常用）"])
         self.output_format = tk.StringVar(value="JPG")
         self.max_kb = tk.IntVar(value=50)
+        self.thread_count = tk.IntVar(value=default_threads)
         self.fine_edge = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="等待导入照片或文件夹")
 
@@ -556,11 +560,12 @@ class App:
             pass
 
         style.configure("App.TFrame", background=THEME["bg"])
+        style.configure("Card.TFrame", background=THEME["card"])
         style.configure(
             "Title.TLabel",
             background=THEME["bg"],
             foreground=THEME["text"],
-            font=("Microsoft YaHei UI", 16, "bold"),
+            font=("Microsoft YaHei UI", 15, "bold"),
         )
         style.configure(
             "Subtitle.TLabel",
@@ -599,14 +604,13 @@ class App:
             thickness=8,
         )
 
-    def _make_card(self, parent, pady=(0, 8)):
-        """稳定的卡片容器：外层浅蓝圆角边框 + 内层白底 Frame，高度由子控件自然撑开"""
+    def _make_card(self, parent, pady=(0, 7)):
         border_box = tk.Frame(parent, bg=THEME["border"], bd=0, highlightthickness=0)
         border_box.pack(fill="x", padx=16, pady=pady)
         inner = tk.Frame(border_box, bg=THEME["card"], bd=0, highlightthickness=0)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
         pad_box = tk.Frame(inner, bg=THEME["card"], bd=0, highlightthickness=0)
-        pad_box.pack(fill="both", expand=True, padx=12, pady=9)
+        pad_box.pack(fill="both", expand=True, padx=12, pady=8)
         return pad_box
 
     def _make_rounded_entry_box(self, parent, textvariable, on_confirm=None):
@@ -628,7 +632,7 @@ class App:
             highlightthickness=0,
             insertbackground=THEME["accent"],
         )
-        entry.pack(fill="x", expand=True, padx=8, pady=6)
+        entry.pack(fill="x", expand=True, padx=8, pady=5)
         if callable(on_confirm):
             entry.bind("<Return>", on_confirm)
             entry.bind("<FocusOut>", on_confirm)
@@ -653,23 +657,23 @@ class App:
     def _build(self):
         # 顶部标题区
         header = ttk.Frame(self.root, style="App.TFrame")
-        header.pack(fill="x", padx=16, pady=(12, 6))
+        header.pack(fill="x", padx=16, pady=(10, 5))
         ttk.Label(header, text=APP_DISPLAY_NAME, style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="AI 智能抠图 · 精细边缘可选 · 保留子文件夹层级与文件名 · 支持 JPG / PNG",
+            text="多线程并发 AI 抠图 · 精细边缘可选 · 保留子文件夹层级与文件名 · 支持 JPG / PNG",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
-        # 卡片 1：导入提示 + 圆角胶囊按钮 + 列表框
-        import_card = self._make_card(self.root, pady=(0, 8))
+        # 卡片 1：导入提示 + 胶囊按钮 + 列表框
+        import_card = self._make_card(self.root, pady=(0, 7))
 
-        drop_canvas = tk.Canvas(import_card, height=56, bg=THEME["card"], highlightthickness=0, bd=0)
+        drop_canvas = tk.Canvas(import_card, height=50, bg=THEME["card"], highlightthickness=0, bd=0)
         drop_canvas.pack(fill="x", pady=(0, 6))
 
         def draw_drop(_e=None):
             w = max(60, drop_canvas.winfo_width())
-            h = max(40, drop_canvas.winfo_height())
+            h = max(38, drop_canvas.winfo_height())
             drop_canvas.delete("all")
             create_rounded_rect(
                 drop_canvas,
@@ -677,21 +681,21 @@ class App:
                 1,
                 w - 1,
                 h - 1,
-                r=16,
+                r=15,
                 fill=THEME["drop_bg"],
                 outline=THEME["drop_border"],
                 width=1.3,
             )
             drop_canvas.create_text(
                 w / 2.0,
-                h / 2.0 - 8,
+                h / 2.0 - 7,
                 text="点击下方“添加照片”或“添加文件夹”选择待处理图片",
                 fill=THEME["drop_fg"],
                 font=("Microsoft YaHei UI", 10, "bold"),
             )
             drop_canvas.create_text(
                 w / 2.0,
-                h / 2.0 + 10,
+                h / 2.0 + 9,
                 text="支持整批照片、总文件夹及多层子文件夹递归扫描",
                 fill="#3B82F6",
                 font=("Microsoft YaHei UI", 8),
@@ -701,9 +705,9 @@ class App:
 
         btn_row = tk.Frame(import_card, bg=THEME["card"])
         btn_row.pack(fill="x", pady=(0, 6))
-        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=96, height=30).pack(side="left", padx=(0, 8))
-        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=108, height=30).pack(side="left")
-        self._make_sec_btn(btn_row, "清空", self.clear, width=76, height=30).pack(side="right")
+        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=96, height=29).pack(side="left", padx=(0, 8))
+        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=108, height=29).pack(side="left")
+        self._make_sec_btn(btn_row, "清空", self.clear, width=76, height=29).pack(side="right")
 
         list_wrap = tk.Frame(
             import_card,
@@ -714,7 +718,7 @@ class App:
         list_wrap.pack(fill="x")
         self.listbox = tk.Listbox(
             list_wrap,
-            height=4,
+            height=3,
             bg=THEME["list_bg"],
             fg=THEME["text"],
             selectbackground=THEME["accent"],
@@ -724,14 +728,14 @@ class App:
             highlightthickness=0,
             font=("Microsoft YaHei UI", 9),
         )
-        self.listbox.pack(fill="x", padx=8, pady=5)
+        self.listbox.pack(fill="x", padx=8, pady=4)
 
-        # 卡片 2：背景颜色、输出格式、大小上限与精细边缘开关
-        set_card = self._make_card(self.root, pady=(0, 8))
-        ttk.Label(set_card, text="处理参数设置", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 6))
+        # 卡片 2：背景颜色、输出格式、大小上限、线程数与精细边缘开关
+        set_card = self._make_card(self.root, pady=(0, 7))
+        ttk.Label(set_card, text="处理参数设置", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 5))
 
         r1 = tk.Frame(set_card, bg=THEME["card"])
-        r1.pack(fill="x", pady=(0, 6))
+        r1.pack(fill="x", pady=(0, 5))
         ttk.Label(r1, text="背景颜色：", style="CardText.TLabel").pack(side="left")
         self.preset = ttk.Combobox(
             r1,
@@ -764,17 +768,17 @@ class App:
         self._make_sec_btn(r1, "自定义颜色", self.choose_color, width=102, height=28).pack(side="right")
 
         r2 = tk.Frame(set_card, bg=THEME["card"])
-        r2.pack(fill="x", pady=(0, 7))
+        r2.pack(fill="x", pady=(0, 6))
         ttk.Label(r2, text="输出格式：", style="CardText.TLabel").pack(side="left")
         self.format_combo = ttk.Combobox(
             r2,
             textvariable=self.output_format,
             values=["JPG", "PNG"],
             state="readonly",
-            width=7,
+            width=6,
             font=("Microsoft YaHei UI", 9),
         )
-        self.format_combo.pack(side="left", padx=(4, 12))
+        self.format_combo.pack(side="left", padx=(4, 10))
 
         ttk.Label(r2, text="大小上限：", style="CardText.TLabel").pack(side="left")
         ttk.Spinbox(
@@ -784,8 +788,18 @@ class App:
             textvariable=self.max_kb,
             width=6,
             font=("Microsoft YaHei UI", 9),
-        ).pack(side="left", padx=(4, 6))
-        ttk.Label(r2, text="KB（超限时尝试降质/缩放）", style="MutedCard.TLabel").pack(side="left")
+        ).pack(side="left", padx=(4, 10))
+
+        ttk.Label(r2, text="并发线程：", style="CardText.TLabel").pack(side="left")
+        ttk.Spinbox(
+            r2,
+            from_=1,
+            to=8,
+            textvariable=self.thread_count,
+            width=4,
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side="left", padx=(4, 4))
+        ttk.Label(r2, text="线程", style="MutedCard.TLabel").pack(side="left")
 
         r_fine = tk.Frame(set_card, bg=THEME["card"])
         r_fine.pack(fill="x")
@@ -801,21 +815,21 @@ class App:
         lbl_fine.bind("<Button-1>", lambda _e: self.fine_toggle._toggle())
 
         # 卡片 3：输出目录与 AI 模型目录
-        dir_card = self._make_card(self.root, pady=(0, 8))
-        ttk.Label(dir_card, text="输出文件夹（默认桌面，可点击“浏览”或“原目录”修改）", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 4))
+        dir_card = self._make_card(self.root, pady=(0, 7))
+        ttk.Label(dir_card, text="输出文件夹（默认桌面，可点击“浏览”或“原目录”修改）", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 3))
 
         r3 = tk.Frame(dir_card, bg=THEME["card"])
-        r3.pack(fill="x", pady=(0, 7))
+        r3.pack(fill="x", pady=(0, 6))
         out_box, self.out_entry = self._make_rounded_entry_box(r3, self.output_dir)
         out_box.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=74, height=30).pack(side="left", padx=(0, 6))
-        self._make_sec_btn(r3, "浏览", self.choose_output, width=68, height=30).pack(side="right")
+        self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=74, height=29).pack(side="left", padx=(0, 6))
+        self._make_sec_btn(r3, "浏览", self.choose_output, width=68, height=29).pack(side="right")
 
         ttk.Label(
             dir_card,
             text="AI 模型存放位置（跟随安装程序设置，可鼠标点选目录或键盘输入/粘贴路径）：",
             style="CardTitle.TLabel",
-        ).pack(anchor="w", pady=(0, 4))
+        ).pack(anchor="w", pady=(0, 3))
 
         r4 = tk.Frame(dir_card, bg=THEME["card"])
         r4.pack(fill="x")
@@ -825,7 +839,7 @@ class App:
             on_confirm=self._on_model_entry_confirm,
         )
         model_box.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self._make_sec_btn(r4, "选择目录", self.choose_model_dir, width=92, height=30).pack(side="right")
+        self._make_sec_btn(r4, "选择目录", self.choose_model_dir, width=92, height=29).pack(side="right")
 
         # 底部进度条 + 胶囊回弹波动主按钮 + 提示
         bottom = ttk.Frame(self.root, style="App.TFrame")
@@ -837,13 +851,13 @@ class App:
             style="Blue.Horizontal.TProgressbar",
         )
         self.progress.pack(fill="x", pady=(0, 4))
-        ttk.Label(bottom, textvariable=self.status, style="Status.TLabel").pack(anchor="w", pady=(0, 7))
+        ttk.Label(bottom, textvariable=self.status, style="Status.TLabel").pack(anchor="w", pady=(0, 6))
 
         self.start_btn = SmoothAnimatedButton(
             bottom,
             text="开始批量处理",
             command=self.start,
-            width=580,
+            width=600,
             height=46,
             radius=23,
             bg_color=THEME["accent"],
@@ -863,10 +877,10 @@ class App:
 
         ttk.Label(
             bottom,
-            text="提示：默认输出在桌面；模型目录与安装时一致；点击“原目录”可将输出设为原图所在文件夹，原图不会被修改。",
+            text="提示：默认输出在桌面；模型目录与安装时一致；支持多线程并发处理，原图不会被修改。",
             style="Subtitle.TLabel",
-            wraplength=580,
-        ).pack(anchor="w", pady=(6, 0))
+            wraplength=600,
+        ).pack(anchor="w", pady=(5, 0))
 
     def _add_paths(self, paths):
         valid = [p for p in paths if Path(p).exists()]
@@ -975,17 +989,59 @@ class App:
             messagebox.showwarning("提示", "请输入或选择一个 AI 模型存放目录。")
             return
 
+        try:
+            workers = max(1, min(8, int(self.thread_count.get())))
+        except Exception:
+            workers = 2
+
         fmt = (self.output_format.get() or "JPG").upper()
         fine_edge = bool(self.fine_edge.get())
         self.start_btn.set_state("disabled")
         self.progress.configure(maximum=len(images), value=0)
         threading.Thread(
             target=self._worker,
-            args=(images, out, rgb, fmt, self.max_kb.get(), chosen_model_str, fine_edge),
+            args=(images, out, rgb, fmt, self.max_kb.get(), chosen_model_str, fine_edge, workers),
             daemon=True,
         ).start()
 
-    def _worker(self, images, out, rgb, fmt, max_kb, chosen_model_str, fine_edge):
+    def _process_single_image(self, src, session, out, rgb, fmt, max_kb, fine_edge, root_for, ext):
+        with Image.open(src) as im:
+            im = ImageOps.exif_transpose(im).convert("RGBA")
+            if fine_edge:
+                cut = remove(
+                    im,
+                    session=session,
+                    alpha_matting=True,
+                    alpha_matting_foreground_threshold=240,
+                    alpha_matting_background_threshold=10,
+                    alpha_matting_erode_size=10,
+                    post_process_mask=True,
+                )
+            else:
+                cut = remove(im, session=session)
+            if not isinstance(cut, Image.Image):
+                cut = Image.open(io.BytesIO(cut)).convert("RGBA")
+            else:
+                cut = cut.convert("RGBA")
+
+        bg = Image.new("RGBA", cut.size, (*rgb, 255))
+        bg.alpha_composite(cut)
+        result = bg.convert("RGB")
+
+        root = root_for[src]
+        try:
+            relative = src.relative_to(root)
+        except ValueError:
+            relative = Path(src.name)
+        target_dir = out / (relative.parent if root.is_dir() else Path())
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / (src.stem + ext)
+        if target.exists() and src.suffix.lower() != ext:
+            target = target_dir / (src.stem + f"_converted{ext}")
+        data = encode_image_under_limit(result, fmt, max_kb)
+        target.write_bytes(data)
+
+    def _worker(self, images, out, rgb, fmt, max_kb, chosen_model_str, fine_edge, workers):
         if remove is None or new_session is None:
             self.msgq.put(("fatal", "缺少 rembg 组件，请检查打包是否完整。"))
             return
@@ -994,7 +1050,7 @@ class App:
                 chosen_model_str,
                 status_cb=lambda text: self.msgq.put(("status", text)),
             )
-            self.msgq.put(("status", "正在加载 AI 抠图模型……"))
+            self.msgq.put(("status", f"正在加载 AI 抠图模型（{workers} 线程并发）……"))
             session = new_session("u2net")
         except Exception as e:
             self.msgq.put(("fatal", f"AI 模型加载失败：{e}"))
@@ -1007,49 +1063,56 @@ class App:
             root_for[f] = max(candidates, key=lambda x: len(x.parts)) if candidates else f.parent
 
         ext = ".png" if fmt == "PNG" else ".jpg"
+        effective_workers = min(workers, len(images))
         ok = 0
+        done_count = 0
         errors = []
-        for idx, src in enumerate(images, 1):
-            try:
-                with Image.open(src) as im:
-                    im = ImageOps.exif_transpose(im).convert("RGBA")
-                    if fine_edge:
-                        cut = remove(
-                            im,
-                            session=session,
-                            alpha_matting=True,
-                            alpha_matting_foreground_threshold=240,
-                            alpha_matting_background_threshold=10,
-                            alpha_matting_erode_size=10,
-                            post_process_mask=True,
-                        )
-                    else:
-                        cut = remove(im, session=session)
-                    if not isinstance(cut, Image.Image):
-                        cut = Image.open(io.BytesIO(cut)).convert("RGBA")
-                    else:
-                        cut = cut.convert("RGBA")
-                bg = Image.new("RGBA", cut.size, (*rgb, 255))
-                bg.alpha_composite(cut)
-                result = bg.convert("RGB")
+        lock = threading.Lock()
 
-                root = root_for[src]
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            future_map = {
+                executor.submit(
+                    self._process_single_image,
+                    src,
+                    session,
+                    out,
+                    rgb,
+                    fmt,
+                    max_kb,
+                    fine_edge,
+                    root_for,
+                    ext,
+                ): src
+                for src in images
+            }
+
+            for fut in as_completed(future_map):
+                src = future_map[fut]
                 try:
-                    relative = src.relative_to(root)
-                except ValueError:
-                    relative = Path(src.name)
-                target_dir = out / (relative.parent if root.is_dir() else Path())
-                target_dir.mkdir(parents=True, exist_ok=True)
-                target = target_dir / (src.stem + ext)
-                if target.exists() and src.suffix.lower() != ext:
-                    target = target_dir / (src.stem + f"_converted{ext}")
-                data = encode_image_under_limit(result, fmt, max_kb)
-                target.write_bytes(data)
-                ok += 1
-                self.msgq.put(("progress", idx, len(images), f"处理中 {idx}/{len(images)}：{src.name}"))
-            except Exception as e:
-                errors.append(f"{src}: {e}")
-                self.msgq.put(("progress", idx, len(images), f"失败 {idx}/{len(images)}：{src.name}"))
+                    fut.result()
+                    with lock:
+                        ok += 1
+                        done_count += 1
+                        cur_ok = ok
+                        cur_done = done_count
+                    self.msgq.put((
+                        "progress",
+                        cur_done,
+                        len(images),
+                        f"多线程处理中 {cur_done}/{len(images)}（成功 {cur_ok}）：{src.name}",
+                    ))
+                except Exception as e:
+                    with lock:
+                        errors.append(f"{src}: {e}")
+                        done_count += 1
+                        cur_done = done_count
+                    self.msgq.put((
+                        "progress",
+                        cur_done,
+                        len(images),
+                        f"失败 {cur_done}/{len(images)}：{src.name}",
+                    ))
+
         self.msgq.put(("done", ok, len(images), errors, str(out)))
 
     def _poll(self):
