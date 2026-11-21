@@ -2,6 +2,16 @@ name: Build Windows Installer EXE
 
 on:
   workflow_dispatch:
+    inputs:
+      build_target:
+        description: "选择要生成的版本"
+        required: true
+        default: "installer"
+        type: choice
+        options:
+          - installer
+          - portable
+          - all
   push:
     branches: [ main, master ]
 
@@ -92,6 +102,7 @@ jobs:
             "证件照批量换底色.py"
 
       - name: 7. 同步版本号并编译 Inno Setup 安装程序
+        if: ${{ github.event_name == 'push' || github.event.inputs.build_target == 'installer' || github.event.inputs.build_target == 'all' }}
         shell: pwsh
         run: |
           $verStr = "${{ env.APP_VERSION }}"
@@ -102,16 +113,18 @@ jobs:
           & $iscc "installer.iss"
 
       - name: 8. 打包免安装文件夹为便携 ZIP
+        if: ${{ github.event.inputs.build_target == 'portable' || github.event.inputs.build_target == 'all' }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "portable_out" | Out-Null
           $zipPath = "portable_out\证件照批量换底色工具_Czq_免安装版_v${{ env.APP_VERSION }}.zip"
           Compress-Archive -Path "dist\证件照批量换底色工具_Czq" -DestinationPath $zipPath -Force
 
-      - name: 9. 上传安装程序与免安装文件夹压缩包
+      - name: 9. 上传构建产物
         uses: actions/upload-artifact@v4
         with:
           name: 证件照批量换底色工具_Czq_v${{ env.APP_VERSION }}
           path: |
             output\*.exe
             portable_out\*.zip
+          if-no-files-found: ignore

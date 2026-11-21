@@ -1,6 +1,6 @@
 ; 证件照批量换底色工具_Czq Inno Setup 安装脚本
 #define MyAppName "证件照批量换底色工具_Czq"
-#define MyAppVersion "2.1.0.2"
+#define MyAppVersion "1.0"
 #define MyAppPublisher "Czq"
 #define MyAppExeName "证件照批量换底色工具_Czq.exe"
 
@@ -14,11 +14,11 @@ DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 SetupIconFile=app.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
-Compression=lzma2
-SolidCompression=yes
+Compression=lzma2/fast
+SolidCompression=no
 WizardStyle=modern
 OutputDir=output
-OutputBaseFilename=证件照批量换底色工具_安装程序_Czq
+OutputBaseFilename=证件照批量换底色工具_安装程序_CZQ
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -40,7 +40,7 @@ SelectDirBrowseLabel=选择 {#MyAppName} 的安装文件夹，然后单击“下
 DiskSpaceMBLabel=请确保目标磁盘有充足的可用空间。
 ReadyLabel1=安装程序现在准备开始将 {#MyAppName} 安装到您的电脑中。
 ReadyLabel2a=单击“安装”继续安装，或单击“上一步”查看或更改设置。
-InstallingLabel=正在安装 {#MyAppName}，请稍候...
+InstallingLabel=正在提取并安装 {#MyAppName} 文件，请稍候...
 FinishedHeadingLabel=正在完成 {#MyAppName} 安装向导
 FinishedLabelNoIcons=安装程序已完成在您的电脑上安装 {#MyAppName}。
 FinishedLabel=安装程序已完成在您的电脑上安装 {#MyAppName}。您可以选择运行已安装的应用程序。
@@ -59,3 +59,13 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "运行 {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssInstall then
+  begin
+    WizardForm.StatusLabel.Caption := '正在提取程序与 AI 模型文件，请稍候...';
+    WizardForm.Update;
+  end;
+end;
