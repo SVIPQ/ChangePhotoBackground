@@ -1,6 +1,6 @@
 ; 证件照批量换底色工具_Czq Inno Setup 安装脚本
 #define MyAppName "证件照批量换底色工具_Czq"
-#define MyAppVersion "2.1"
+#define MyAppVersion "1.0"
 #define MyAppPublisher "Czq"
 #define MyAppExeName "证件照批量换底色工具_Czq.exe"
 #define MyRegKey "Software\证件照批量换底色工具_Czq"
@@ -26,7 +26,7 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 
 [CustomMessages]
 ModelPageCaption=AI 模型存放位置设置
-ModelPageDescription=请选择要使用的 AI 模型及存放文件夹。
+ModelPageDescription=请选择要使用的 AI 模型及存放文件夹（模型体积较大，建议选择空间充足的非 C 盘目录）。
 ModelSelectLabel=选择 AI 模型：
 ModelDirLabel=模型存放目录（随所选模型自动生成对应名称文件夹）：
 ModelBrowseBtn=浏览(&B)...
