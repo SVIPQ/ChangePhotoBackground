@@ -74,6 +74,8 @@ Filename: "{app}\{#MyAppExeName}"; Description: "运行 {#MyAppName}"; Flags: no
 [Code]
 var
   ModelPage: TWizardPage;
+  ModelSelectLabelCtrl: TLabel;
+  ModelDirLabelCtrl: TLabel;
   ModelCombo: TComboBox;
   ModelDirEdit: TEdit;
   ModelBrowseButton: TButton;
@@ -136,64 +138,51 @@ begin
     CustomMessage('ModelPageDescription')
   );
 
-  TLabel.Create(ModelPage).Parent := ModelPage.Surface;
-  with TLabel(ModelPage.Surface.Controls[ModelPage.Surface.ControlCount - 1]) do
-  begin
-    Caption := CustomMessage('ModelSelectLabel');
-    Left := 0;
-    Top := 4;
-    Width := ModelPage.SurfaceWidth;
-  end;
+  ModelSelectLabelCtrl := TLabel.Create(ModelPage);
+  ModelSelectLabelCtrl.Parent := ModelPage.Surface;
+  ModelSelectLabelCtrl.Caption := CustomMessage('ModelSelectLabel');
+  ModelSelectLabelCtrl.Left := 0;
+  ModelSelectLabelCtrl.Top := 4;
+  ModelSelectLabelCtrl.Width := ModelPage.SurfaceWidth;
 
   ModelCombo := TComboBox.Create(ModelPage);
-  with ModelCombo do
-  begin
-    Parent := ModelPage.Surface;
-    Style := csDropDownList;
-    Left := 0;
-    Top := 24;
-    Width := ModelPage.SurfaceWidth;
-    Items.Add('birefnet-portrait（人像发丝默认）');
-    Items.Add('nrnet（对应文件夹 nr.net）');
-    Items.Add('isnet-general-use（高精度通用）');
-    Items.Add('u2net（经典通用）');
-    ItemIndex := 0;
-    OnChange := @ModelComboChange;
-  end;
+  ModelCombo.Parent := ModelPage.Surface;
+  ModelCombo.Style := csDropDownList;
+  ModelCombo.Left := 0;
+  ModelCombo.Top := 24;
+  ModelCombo.Width := ModelPage.SurfaceWidth;
+  ModelCombo.Items.Add('birefnet-portrait（人像发丝默认）');
+  ModelCombo.Items.Add('nrnet（对应文件夹 nr.net）');
+  ModelCombo.Items.Add('isnet-general-use（高精度通用）');
+  ModelCombo.Items.Add('u2net（经典通用）');
+  ModelCombo.ItemIndex := 0;
+  ModelCombo.OnChange := @ModelComboChange;
 
   SelectedModelDir := BuildDefaultModelDirForIndex(0);
 
-  TLabel.Create(ModelPage).Parent := ModelPage.Surface;
-  with TLabel(ModelPage.Surface.Controls[ModelPage.Surface.ControlCount - 1]) do
-  begin
-    Caption := CustomMessage('ModelDirLabel');
-    Left := 0;
-    Top := 60;
-    Width := ModelPage.SurfaceWidth;
-  end;
+  ModelDirLabelCtrl := TLabel.Create(ModelPage);
+  ModelDirLabelCtrl.Parent := ModelPage.Surface;
+  ModelDirLabelCtrl.Caption := CustomMessage('ModelDirLabel');
+  ModelDirLabelCtrl.Left := 0;
+  ModelDirLabelCtrl.Top := 60;
+  ModelDirLabelCtrl.Width := ModelPage.SurfaceWidth;
 
   ModelDirEdit := TEdit.Create(ModelPage);
-  with ModelDirEdit do
-  begin
-    Parent := ModelPage.Surface;
-    Left := 0;
-    Top := 82;
-    Width := ModelPage.SurfaceWidth - 92;
-    Height := 24;
-    Text := SelectedModelDir;
-  end;
+  ModelDirEdit.Parent := ModelPage.Surface;
+  ModelDirEdit.Left := 0;
+  ModelDirEdit.Top := 82;
+  ModelDirEdit.Width := ModelPage.SurfaceWidth - 92;
+  ModelDirEdit.Height := 24;
+  ModelDirEdit.Text := SelectedModelDir;
 
   ModelBrowseButton := TButton.Create(ModelPage);
-  with ModelBrowseButton do
-  begin
-    Parent := ModelPage.Surface;
-    Left := ModelPage.SurfaceWidth - 82;
-    Top := 81;
-    Width := 82;
-    Height := 26;
-    Caption := CustomMessage('ModelBrowseBtn');
-    OnClick := @ModelBrowseClick;
-  end;
+  ModelBrowseButton.Parent := ModelPage.Surface;
+  ModelBrowseButton.Left := ModelPage.SurfaceWidth - 82;
+  ModelBrowseButton.Top := 81;
+  ModelBrowseButton.Width := 82;
+  ModelBrowseButton.Height := 26;
+  ModelBrowseButton.Caption := CustomMessage('ModelBrowseBtn');
+  ModelBrowseButton.OnClick := @ModelBrowseClick;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
