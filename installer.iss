@@ -22,7 +22,29 @@ OutputDir=output
 OutputBaseFilename=证件照批量换底色工具_安装程序_CZQ
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Messages]
+SetupAppTitle=安装 %1
+SetupWindowTitle=安装 - %1
+NextButtonLabel=下一步(&N) >
+BackButtonLabel=< 上一步(&B)
+InstallButtonLabel=安装(&I)
+CancelButtonLabel=取消
+CloseButtonLabel=关闭(&C)
+FinishButtonLabel=完成(&F)
+BrowseLabel=浏览(&B)...
+ClickNext=继续请单击“下一步”，或单击“取消”退出安装程序。
+SelectDirLabel=选择目标位置
+SelectDirDesc=您希望将 %1 安装到何处？
+SelectDirBrowseLabel=选择 %1 的安装文件夹，然后单击“下一步”。
+DiskSpaceMBLabel=至少需要 [mb] MB 的可用磁盘空间。
+ReadyLabel1=安装程序现在准备开始将 %1 安装到您的电脑中。
+ReadyLabel2a=单击“安装”继续安装，或单击“上一步”查看或更改设置。
+InstallingLabel=正在安装 %1，请稍候...
+FinishedHeadingLabel=正在完成 %1 安装向导
+FinishedLabelNoIcons=安装程序已完成在您的电脑上安装 %1。
+FinishedLabel=安装程序已完成在您的电脑上安装 %1。您可以选择运行已安装的应用程序。
 
 [CustomMessages]
 ModelPageCaption=AI 模型存放位置设置
@@ -32,7 +54,7 @@ ModelDirLabel=模型存放目录（随所选模型自动生成对应名称文件
 ModelBrowseBtn=浏览(&B)...
 
 [Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescription: "附加图标:"; Flags: unchecked
 
 [Files]
 Source: "dist\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -40,14 +62,14 @@ Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"
-Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
+Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"; Tasks: desktopicon
 
 [Registry]
 Root: HKCU; Subkey: "{#MyRegKey}"; ValueType: string; ValueName: "ModelDir"; ValueData: "{code:GetModelDir}"; Flags: uninsdeletekey
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "运行 {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 var
