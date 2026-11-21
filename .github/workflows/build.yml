@@ -5,6 +5,12 @@ on:
   push:
     branches: [ main, master ]
 
+env:
+  APP_VERSION: "1.0"
+
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -21,54 +27,81 @@ jobs:
       - name: 3. 安装依赖与 PyInstaller
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller pillow rembg onnxruntime
+          pip install pyinstaller pillow rembg onnxruntime tkinterdnd2
 
-      - name: 4. 预下载离线 AI 抠图模型 (.u2net)
+      - name: 4. 预下载默认离线 AI 抠图模型 (birefnet-portrait)
+        env:
+          U2NET_HOME: ${{ github.workspace }}\build_u2net\.u2net
+        run: |
+          python -c "import os; os.makedirs(os.environ['U2NET_HOME'], exist_ok=True); from rembg import new_session; new_session('birefnet-portrait')"
+
+      - name: 5. 生成与 APP_VERSION 同步的 EXE 版本信息文件
         shell: pwsh
         run: |
-          $env:U2NET_HOME = "$PWD\.u2net"
-          New-Item -ItemType Directory -Force -Path $env:U2NET_HOME | Out-Null
-          python -c "import os; os.environ['U2NET_HOME'] = os.path.abspath('.u2net'); from rembg import new_session; new_session('u2net'); print('Model downloaded to:', os.environ['U2NET_HOME'])"
+          $ver = "${{ env.APP_VERSION }}".Trim().TrimStart('v', 'V')
+          $parts = @($ver -split '\.' | Where-Object { $_ -match '^\d+$' })
+          while ($parts.Count -lt 4) { $parts += "0" }
+          $vTuple = "$($parts[0]), $($parts[1]), $($parts[2]), $($parts[3])"
+          $verStr = "${{ env.APP_VERSION }}"
 
-      - name: 5. 准备图标与资源检查
+          $content = @"
+          VSVersionInfo(
+            ffi=FixedFileInfo(
+              filevers=($vTuple),
+              prodvers=($vTuple),
+              mask=0x3f,
+              flags=0x0,
+              OS=0x40004,
+              fileType=0x1,
+              subtype=0x0,
+              date=(0, 0)
+            ),
+            kids=[
+              StringFileInfo([
+                StringTable(
+                  u'080404b0',
+                  [
+                    StringStruct(u'CompanyName', u'Czq'),
+                    StringStruct(u'FileDescription', u'证件照批量换底色工具_Czq'),
+                    StringStruct(u'FileVersion', u'$verStr'),
+                    StringStruct(u'InternalName', u'证件照批量换底色工具_Czq'),
+                    StringStruct(u'LegalCopyright', u'Copyright (c) Czq'),
+                    StringStruct(u'OriginalFilename', u'证件照批量换底色工具_Czq.exe'),
+                    StringStruct(u'ProductName', u'证件照批量换底色工具_Czq'),
+                    StringStruct(u'ProductVersion', u'$verStr')
+                  ]
+                )
+              ]),
+              VarFileInfo([VarStruct(u'Translation', [2052, 1200])])
+            ]
+          )
+          "@
+          Set-Content -Path "version_info.txt" -Value $content -Encoding UTF8
+
+      - name: 6. 使用 PyInstaller 打包主程序（含版本信息）
+        run: |
+          pyinstaller --noconfirm --clean --onedir --windowed ^
+            --name "证件照批量换底色工具_Czq" ^
+            --icon "app.ico" ^
+            --version-file "version_info.txt" ^
+            --collect-all tkinterdnd2 ^
+            --collect-all rembg ^
+            --add-data "app.ico;." ^
+            --add-data "build_u2net\.u2net;.u2net" ^
+            "证件照批量换底色.py"
+
+      - name: 7. 同步版本号并编译 Inno Setup 安装程序
         shell: pwsh
         run: |
-          if (-not (Test-Path "app.ico")) {
-            python -c "from PIL import Image; img = Image.new('RGBA', (256, 256), (37, 99, 235, 255)); img.save('app.ico', format='ICO', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])"
-          }
-
-      - name: 6. 打包程序根目录（含自定义图标、离线模型与包元数据）
-        shell: pwsh
-        run: |
-          $entryScript = Get-ChildItem -Filter "证件照批量换底色.py" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $entryScript) {
-            $entryScript = Get-ChildItem -Filter "*.py" | Where-Object { $_.Name -notlike "test*" } | Select-Object -First 1
-          }
-          if (-not $entryScript) {
-            throw "未找到主 Python 脚本（*.py）"
-          }
-          pyinstaller --noconfirm --clean --onedir --windowed `
-            --name "证件照批量换底色工具_Czq" `
-            --icon "app.ico" `
-            --add-data ".u2net;.u2net" `
-            --copy-metadata pymatting `
-            --copy-metadata rembg `
-            --copy-metadata onnxruntime `
-            --copy-metadata pillow `
-            --copy-metadata pooch `
-            --collect-all rembg `
-            --collect-all onnxruntime `
-            --collect-all pooch `
-            $entryScript.FullName
-
-      - name: 7. 安装 Inno Setup 并编译安装程序 EXE
-        shell: pwsh
-        run: |
+          $verStr = "${{ env.APP_VERSION }}"
+          (Get-Content "installer.iss" -Raw) -replace '#define MyAppVersion ".*"', "#define MyAppVersion `"$verStr`"" | Set-Content "installer.iss" -NoNewline -Encoding UTF8
           choco install innosetup -y
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer.iss"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "ISCC.exe" }
+          & $iscc "installer.iss"
 
-      - name: 8. 上传最终安装程序
+      - name: 8. 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: 证件照批量换底色工具_安装程序_Czq
-          path: Output\证件照批量换底色工具_安装程序_Czq.exe
+          name: 证件照批量换底色工具_Czq_安装包_${{ env.APP_VERSION }}
+          path: output\*.exe
