@@ -1,6 +1,6 @@
 ; 证件照批量换底色工具_Czq Inno Setup 安装脚本
 #define MyAppName "证件照批量换底色工具_Czq"
-#define MyAppVersion "1.0"
+#define MyAppVersion "2.1.0.4"
 #define MyAppPublisher "Czq"
 #define MyAppExeName "证件照批量换底色工具_Czq.exe"
 
@@ -18,7 +18,7 @@ Compression=lzma2/fast
 SolidCompression=no
 WizardStyle=modern
 OutputDir=output
-OutputBaseFilename=证件照批量换底色工具_安装程序_CZQ
+OutputBaseFilename=证件照批量换底色工具_安装程序_Czq
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

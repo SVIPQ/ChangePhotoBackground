@@ -12,11 +12,9 @@ on:
           - installer
           - portable
           - all
-  push:
-    branches: [ main, master ]
 
 env:
-  APP_VERSION: "2.1.0.2"
+  APP_VERSION: "2.1.0.4"
 
 permissions:
   contents: write
@@ -102,7 +100,7 @@ jobs:
             "证件照批量换底色.py"
 
       - name: 7. 同步版本号并编译 Inno Setup 安装程序
-        if: ${{ github.event_name == 'push' || github.event.inputs.build_target == 'installer' || github.event.inputs.build_target == 'all' }}
+        if: ${{ github.event.inputs.build_target == 'installer' || github.event.inputs.build_target == 'all' }}
         shell: pwsh
         run: |
           $verStr = "${{ env.APP_VERSION }}"
