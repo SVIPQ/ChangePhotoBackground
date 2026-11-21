@@ -83,12 +83,18 @@ def get_app_root_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def get_u2net_home_dir() -> Path:
+    """
+    U2NET_HOME 固定为：<软件根目录>\_internal\.u2net
+    rembg 内部会自动在此目录下拼接 models\<model_name>\，从而指向：
+    <软件根目录>\_internal\.u2net\models\<model_name>\
+    """
+    return get_app_root_dir() / "_internal" / ".u2net"
+
+
 def get_fixed_models_root() -> Path:
-    """
-    固定模型存放根目录：<软件根目录>\_internal\.u2net\models
-    每个模型存放在其同名子文件夹下：<软件根目录>\_internal\.u2net\models\<model_name>\
-    """
-    return get_app_root_dir() / "_internal" / ".u2net" / "models"
+    """固定模型存放根目录：<软件根目录>\_internal\.u2net\models"""
+    return get_u2net_home_dir() / "models"
 
 
 def get_model_subdir(model_name: str) -> Path:
@@ -99,7 +105,7 @@ def get_model_subdir(model_name: str) -> Path:
 def _find_existing_model_file(model_name: str) -> Path | None:
     """
     在固定目录 <软件根目录>\_internal\.u2net\models\<model_name> 下查找模型权重文件；
-    若尚未在该子目录中，也顺便检查同级 _internal\.u2net 下是否有同名文件并归整到对应子文件夹。
+    若误落在误多拼一层 models\models\<model_name> 或扁平 _internal\.u2net 下，自动归整过来。
     """
     models_root = get_fixed_models_root()
     model_dir = models_root / model_name
@@ -109,7 +115,17 @@ def _find_existing_model_file(model_name: str) -> Path | None:
         if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS:
             return f
 
-    legacy_u2net = get_app_root_dir() / "_internal" / ".u2net"
+    # 兼容之前误多拼一层 models 的目录：<软件根目录>\_internal\.u2net\models\models\<model_name>
+    wrong_nested_dir = models_root / "models" / model_name
+    if wrong_nested_dir.exists() and wrong_nested_dir.is_dir():
+        for f in wrong_nested_dir.rglob("*"):
+            if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS:
+                dst = model_dir / f.name
+                if not dst.exists():
+                    dst.write_bytes(f.read_bytes())
+                return dst
+
+    legacy_u2net = get_u2net_home_dir()
     if legacy_u2net.exists() and legacy_u2net.is_dir():
         key_token = model_name.lower().replace("-", "_")
         for f in legacy_u2net.iterdir():
@@ -125,10 +141,15 @@ def _find_existing_model_file(model_name: str) -> Path | None:
 
 
 def prepare_model_env(model_name: str | None = None) -> Path:
-    """固定配置环境变量指向 <软件根目录>\_internal\.u2net\models"""
+    """
+    将 U2NET_HOME 固定设为 <软件根目录>\_internal\.u2net，
+    并确保 <软件根目录>\_internal\.u2net\models\<model_name> 存在。
+    """
+    u2net_home = get_u2net_home_dir()
     models_root = get_fixed_models_root()
+    u2net_home.mkdir(parents=True, exist_ok=True)
     models_root.mkdir(parents=True, exist_ok=True)
-    os.environ["U2NET_HOME"] = str(models_root)
+    os.environ["U2NET_HOME"] = str(u2net_home)
 
     if model_name:
         model_dir = get_model_subdir(model_name)
@@ -1339,6 +1360,7 @@ class App:
         return MODEL_OPTIONS.get(label, "birefnet-portrait")
 
     def download_selected_model(self):
+        """将当前选中的模型下载到固定目录 <软件根目录>\_internal\.u2net\models\<model_name>"""
         if self._is_downloading_model or self._is_running:
             messagebox.showinfo("提示", "当前有任务正在执行，请稍候。")
             return
@@ -1439,7 +1461,6 @@ class App:
                 from PIL import ImageFilter as _flt
                 flt = _flt
 
-            # 保留完整前景轮廓，避免过度腐蚀吃掉浅色肩膀/衣料
             if fine_edge:
                 a_clean = a_ch.filter(flt.GaussianBlur(radius=0.35))
             else:
@@ -1454,7 +1475,6 @@ class App:
             for y in range(h):
                 for x in range(w):
                     alpha_val = a_px[x, y]
-                    # 仅对半透明边缘且极亮白边做轻微混合，保护白色/浅色衣料
                     if 0 < alpha_val < 210:
                         if r_px[x, y] > 228 and g_px[x, y] > 228 and b_px[x, y] > 228:
                             r_px[x, y] = int(r_px[x, y] * (1 - blend) + rgb[0] * blend)

@@ -1,6 +1,6 @@
 ; 证件照批量换底色工具_Czq Inno Setup 安装脚本
 #define MyAppName "证件照批量换底色工具_Czq"
-#define MyAppVersion "2.2.0.2"
+#define MyAppVersion "2.2.0.3"
 #define MyAppPublisher "Czq"
 #define MyAppExeName "证件照批量换底色工具_Czq.exe"
 #define MyDesktopShortcutName "证件照批量换底色工具"
