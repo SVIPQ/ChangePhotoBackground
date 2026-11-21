@@ -1,9 +1,8 @@
 ; 证件照批量换底色工具_Czq Inno Setup 安装脚本
 #define MyAppName "证件照批量换底色工具_Czq"
-#define MyAppVersion "1.0"
+#define MyAppVersion "2.1.0.2"
 #define MyAppPublisher "Czq"
 #define MyAppExeName "证件照批量换底色工具_Czq.exe"
-#define MyRegKey "Software\证件照批量换底色工具_Czq"
 
 [Setup]
 AppId={{8D6E7B42-4F5B-4C7A-9B2E-1F4A8C3D9E01}
@@ -25,8 +24,8 @@ OutputBaseFilename=证件照批量换底色工具_安装程序_Czq
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Messages]
-SetupAppTitle=安装 %1
-SetupWindowTitle=安装 - %1
+SetupAppTitle=安装 {#MyAppName}
+SetupWindowTitle=安装 - {#MyAppName}
 NextButtonLabel=下一步(&N) >
 BackButtonLabel=< 上一步(&B)
 InstallButtonLabel=安装(&I)
@@ -36,25 +35,18 @@ FinishButtonLabel=完成(&F)
 BrowseLabel=浏览(&B)...
 ClickNext=继续请单击“下一步”，或单击“取消”退出安装程序。
 SelectDirLabel=选择目标位置
-SelectDirDesc=您希望将 %1 安装到何处？
-SelectDirBrowseLabel=选择 %1 的安装文件夹，然后单击“下一步”。
-DiskSpaceMBLabel=至少需要 [mb] MB 的可用磁盘空间。
-ReadyLabel1=安装程序现在准备开始将 %1 安装到您的电脑中。
+SelectDirDesc=您希望将 {#MyAppName} 安装到何处？
+SelectDirBrowseLabel=选择 {#MyAppName} 的安装文件夹，然后单击“下一步”。
+DiskSpaceMBLabel=请确保目标磁盘有充足的可用空间。
+ReadyLabel1=安装程序现在准备开始将 {#MyAppName} 安装到您的电脑中。
 ReadyLabel2a=单击“安装”继续安装，或单击“上一步”查看或更改设置。
-InstallingLabel=正在安装 %1，请稍候...
-FinishedHeadingLabel=正在完成 %1 安装向导
-FinishedLabelNoIcons=安装程序已完成在您的电脑上安装 %1。
-FinishedLabel=安装程序已完成在您的电脑上安装 %1。您可以选择运行已安装的应用程序。
-
-[CustomMessages]
-ModelPageCaption=AI 模型存放位置设置
-ModelPageDescription=请选择要使用的 AI 模型及存放文件夹（模型体积较大，建议选择空间充足的非 C 盘目录）。
-ModelSelectLabel=选择 AI 模型：
-ModelDirLabel=模型存放目录（随所选模型自动生成对应名称文件夹）：
-ModelBrowseBtn=浏览(&B)...
+InstallingLabel=正在安装 {#MyAppName}，请稍候...
+FinishedHeadingLabel=正在完成 {#MyAppName} 安装向导
+FinishedLabelNoIcons=安装程序已完成在您的电脑上安装 {#MyAppName}。
+FinishedLabel=安装程序已完成在您的电脑上安装 {#MyAppName}。您可以选择运行已安装的应用程序。
 
 [Tasks]
-Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescription: "附加图标:"; Flags: unchecked
+Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescription: "附加图标:"
 
 [Files]
 Source: "dist\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -65,154 +57,5 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"; Tasks: desktopicon
 
-[Registry]
-Root: HKCU; Subkey: "{#MyRegKey}"; ValueType: string; ValueName: "ModelDir"; ValueData: "{code:GetModelDir}"; Flags: uninsdeletekey
-
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "运行 {#MyAppName}"; Flags: nowait postinstall skipifsilent
-
-[Code]
-var
-  ModelPage: TWizardPage;
-  ModelSelectLabelCtrl: TLabel;
-  ModelDirLabelCtrl: TLabel;
-  ModelCombo: TComboBox;
-  ModelDirEdit: TEdit;
-  ModelBrowseButton: TButton;
-  SelectedModelDir: string;
-
-function GetBaseDriveRoot(): string;
-begin
-  if DirExists('D:\') then
-    Result := 'D:\'
-  else if DirExists('E:\') then
-    Result := 'E:\'
-  else
-    Result := AddBackslash(ExtractFileDrive(ExpandConstant('{userdocs}')));
-end;
-
-function GetModelFolderNameByIndex(Idx: Integer): string;
-begin
-  case Idx of
-    0: Result := 'birefnet-portrait';
-    1: Result := 'nr.net';
-    2: Result := 'isnet-general-use';
-    3: Result := 'u2net';
-  else
-    Result := 'birefnet-portrait';
-  end;
-end;
-
-function BuildDefaultModelDirForIndex(Idx: Integer): string;
-var
-  BaseRoot, FolderName: string;
-begin
-  BaseRoot := GetBaseDriveRoot();
-  FolderName := GetModelFolderNameByIndex(Idx);
-  Result := BaseRoot + FolderName;
-end;
-
-procedure ModelComboChange(Sender: TObject);
-begin
-  if (ModelCombo <> nil) and (ModelDirEdit <> nil) then
-  begin
-    SelectedModelDir := BuildDefaultModelDirForIndex(ModelCombo.ItemIndex);
-    ModelDirEdit.Text := SelectedModelDir;
-  end;
-end;
-
-procedure ModelBrowseClick(Sender: TObject);
-var
-  Dir: string;
-begin
-  Dir := ModelDirEdit.Text;
-  if BrowseForFolder(CustomMessage('ModelBrowseBtn'), Dir, False) then
-    ModelDirEdit.Text := Dir;
-end;
-
-procedure InitializeWizard;
-begin
-  ModelPage := CreateCustomPage(
-    wpSelectDir,
-    CustomMessage('ModelPageCaption'),
-    CustomMessage('ModelPageDescription')
-  );
-
-  ModelSelectLabelCtrl := TLabel.Create(ModelPage);
-  ModelSelectLabelCtrl.Parent := ModelPage.Surface;
-  ModelSelectLabelCtrl.Caption := CustomMessage('ModelSelectLabel');
-  ModelSelectLabelCtrl.Left := 0;
-  ModelSelectLabelCtrl.Top := 4;
-  ModelSelectLabelCtrl.Width := ModelPage.SurfaceWidth;
-
-  ModelCombo := TComboBox.Create(ModelPage);
-  ModelCombo.Parent := ModelPage.Surface;
-  ModelCombo.Style := csDropDownList;
-  ModelCombo.Left := 0;
-  ModelCombo.Top := 24;
-  ModelCombo.Width := ModelPage.SurfaceWidth;
-  ModelCombo.Items.Add('birefnet-portrait（人像发丝默认）');
-  ModelCombo.Items.Add('nrnet（对应文件夹 nr.net）');
-  ModelCombo.Items.Add('isnet-general-use（高精度通用）');
-  ModelCombo.Items.Add('u2net（经典通用）');
-  ModelCombo.ItemIndex := 0;
-  ModelCombo.OnChange := @ModelComboChange;
-
-  SelectedModelDir := BuildDefaultModelDirForIndex(0);
-
-  ModelDirLabelCtrl := TLabel.Create(ModelPage);
-  ModelDirLabelCtrl.Parent := ModelPage.Surface;
-  ModelDirLabelCtrl.Caption := CustomMessage('ModelDirLabel');
-  ModelDirLabelCtrl.Left := 0;
-  ModelDirLabelCtrl.Top := 60;
-  ModelDirLabelCtrl.Width := ModelPage.SurfaceWidth;
-
-  ModelDirEdit := TEdit.Create(ModelPage);
-  ModelDirEdit.Parent := ModelPage.Surface;
-  ModelDirEdit.Left := 0;
-  ModelDirEdit.Top := 82;
-  ModelDirEdit.Width := ModelPage.SurfaceWidth - 92;
-  ModelDirEdit.Height := 24;
-  ModelDirEdit.Text := SelectedModelDir;
-
-  ModelBrowseButton := TButton.Create(ModelPage);
-  ModelBrowseButton.Parent := ModelPage.Surface;
-  ModelBrowseButton.Left := ModelPage.SurfaceWidth - 82;
-  ModelBrowseButton.Top := 81;
-  ModelBrowseButton.Width := 82;
-  ModelBrowseButton.Height := 26;
-  ModelBrowseButton.Caption := CustomMessage('ModelBrowseBtn');
-  ModelBrowseButton.OnClick := @ModelBrowseClick;
-end;
-
-function NextButtonClick(CurPageID: Integer): Boolean;
-begin
-  Result := True;
-  if (ModelPage <> nil) and (CurPageID = ModelPage.ID) then
-  begin
-    SelectedModelDir := Trim(ModelDirEdit.Text);
-    if SelectedModelDir = '' then
-    begin
-      MsgBox('请填写或选择一个有效的 AI 模型存放目录。', mbError, MB_OK);
-      Result := False;
-      Exit;
-    end;
-    if not DirExists(SelectedModelDir) then
-    begin
-      if not ForceDirectories(SelectedModelDir) then
-      begin
-        MsgBox('无法创建模型文件夹，请检查路径或权限：' + SelectedModelDir, mbError, MB_OK);
-        Result := False;
-        Exit;
-      end;
-    end;
-  end;
-end;
-
-function GetModelDir(Param: string): string;
-begin
-  if Trim(ModelDirEdit.Text) <> '' then
-    Result := Trim(ModelDirEdit.Text)
-  else
-    Result := SelectedModelDir;
-end;

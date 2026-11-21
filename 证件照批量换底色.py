@@ -3,14 +3,14 @@
 证件照批量换底色工具_Czq
 功能：批量导入图片/文件夹（递归扫描子文件夹）、顶部区域鼠标拖放文件夹后手动确认导入、
 手动点击“开始批量处理”执行、多线程并发 AI 抠图（默认 birefnet-portrait 强化人像与发丝细节）、
-统一替换底色、保留子文件夹结构和文件主名称、支持导出 JPG 或 PNG、支持自定义 AI 模型存放目录、
+支持在软件内选择模型并点击“下载模型”直接保存到软件目录的 .u2net 文件夹、
+统一替换底色、保留子文件夹结构和文件主名称、支持导出 JPG 或 PNG、
 支持精细边缘模式（加强头发丝与边缘去白边）、圆润胶囊白蓝界面与连贯进度条。
 """
 import os
 import sys
 import io
 import math
-import shutil
 import traceback
 import threading
 import queue
@@ -36,43 +36,19 @@ if sys.stderr is None:
     sys.stderr = io.StringIO()
 
 
-def _read_installer_model_dir():
-    """读取 Inno Setup 安装时写入的自定义模型目录（Windows 注册表）"""
-    if os.name != "nt":
-        return None
-    try:
-        import winreg
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\证件照批量换底色工具_Czq",
-            0,
-            winreg.KEY_READ,
-        ) as key:
-            val, _ = winreg.QueryValueEx(key, "ModelDir")
-            if val and str(val).strip():
-                return str(val).strip()
-    except Exception:
-        pass
-    return None
-
-
-def _detect_bundled_model_dir():
-    """查找打包自带的 .u2net 模型目录（兼容 PyInstaller 6.x _internal 与同级目录）"""
+def get_app_model_dir() -> Path:
+    """获取软件自身目录内的模型存放文件夹（<软件目录>/.u2net）"""
     if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        for candidate in (exe_dir / "_internal" / ".u2net", exe_dir / ".u2net"):
-            if candidate.exists():
-                return candidate
-    return None
+        base_dir = Path(sys.executable).resolve().parent
+    else:
+        base_dir = Path(__file__).resolve().parent
+    model_dir = base_dir / ".u2net"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    return model_dir
 
 
-_BUNDLED_MODEL_DIR = _detect_bundled_model_dir()
-_INSTALLER_MODEL_DIR = _read_installer_model_dir()
-
-if _INSTALLER_MODEL_DIR:
-    os.environ.setdefault("U2NET_HOME", _INSTALLER_MODEL_DIR)
-elif _BUNDLED_MODEL_DIR is not None:
-    os.environ.setdefault("U2NET_HOME", str(_BUNDLED_MODEL_DIR))
+APP_MODEL_DIR = get_app_model_dir()
+os.environ["U2NET_HOME"] = str(APP_MODEL_DIR)
 
 Image = None
 ImageOps = None
@@ -91,6 +67,7 @@ PRESETS = {
 
 MODEL_OPTIONS = {
     "人像发丝最佳 (birefnet-portrait)": "birefnet-portrait",
+    "人像精细 (nrnet)": "nrnet",
     "高精度通用 (isnet-general-use)": "isnet-general-use",
     "经典通用 (u2net)": "u2net",
 }
@@ -179,34 +156,6 @@ def encode_image_under_limit(image, fmt, max_kb):
             break
         img = img.resize((max(1, int(w * 0.85)), max(1, int(h * 0.85))), Image.Resampling.LANCZOS)
     raise ValueError(f"JPG 在可接受的最低尺寸下仍无法压缩到 {max_kb}KB")
-
-
-def prepare_model_directory(target_dir_str, status_cb=None):
-    """准备自定义模型存放目录，校验路径合法性，并在目标为空且打包自带模型时自动复制。"""
-    raw = (target_dir_str or "").strip()
-    if not raw:
-        raise ValueError("请先填写或选择一个 AI 模型存放目录。")
-
-    target_dir = Path(raw).expanduser()
-    if target_dir.exists() and not target_dir.is_dir():
-        raise ValueError(f"模型路径指向的是文件而非文件夹：{target_dir}")
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    if _BUNDLED_MODEL_DIR is not None and _BUNDLED_MODEL_DIR.resolve() != target_dir.resolve():
-        has_existing_files = any(target_dir.iterdir())
-        if not has_existing_files:
-            if status_cb:
-                status_cb(f"正在复制预置模型到 {target_dir} ……")
-            for item in _BUNDLED_MODEL_DIR.iterdir():
-                dest = target_dir / item.name
-                if item.is_dir():
-                    shutil.copytree(item, dest, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(item, dest)
-
-    os.environ["U2NET_HOME"] = str(target_dir)
-    return target_dir
 
 
 def _rounded_rect_points(x1, y1, x2, y2, r, segments=16):
@@ -783,14 +732,10 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_DISPLAY_NAME)
-        self.root.geometry("640x700")
-        self.root.minsize(580, 660)
+        self.root.geometry("640x670")
+        self.root.minsize(580, 630)
         self.root.configure(bg=THEME["bg"])
 
-        default_model_path = (
-            os.environ.get("U2NET_HOME")
-            or str(Path.home() / "Documents" / "证件照模型_.u2net")
-        )
         default_output_path = str(Path.home() / "Desktop" / "证件照换底色结果")
         cpu_count = os.cpu_count() or 4
         default_threads = max(2, min(4, cpu_count // 2))
@@ -798,8 +743,8 @@ class App:
         self.msgq = queue.Queue()
         self.input_paths = []
         self._images = []
+        self._is_downloading_model = False
         self.output_dir = tk.StringVar(value=default_output_path)
-        self.model_dir = tk.StringVar(value=default_model_path)
         self.model_label_var = tk.StringVar(value="人像发丝最佳 (birefnet-portrait)")
         self.color = tk.StringVar(value=PRESETS["蓝色（常用）"])
         self.output_format = tk.StringVar(value="JPG")
@@ -962,7 +907,6 @@ class App:
             fg=THEME["text"],
             font=("Microsoft YaHei UI", 14, "bold"),
         ).pack(anchor="w")
-        # 蓝框区域：小空边，不打字
         tk.Frame(header, height=6, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
 
         import_outer, import_card = self._make_pill_card(self.root, radius=24)
@@ -1068,10 +1012,18 @@ class App:
             textvariable=self.model_label_var,
             values=list(MODEL_OPTIONS.keys()),
             state="readonly",
-            width=33,
+            width=31,
             font=("Microsoft YaHei UI", 9),
         )
         self.model_combo.pack(side="left", padx=(4, 8))
+        self.download_model_btn = self._make_sec_btn(
+            r_model,
+            "下载模型",
+            self.download_selected_model,
+            width=96,
+            height=26,
+        )
+        self.download_model_btn.pack(side="right")
 
         r2 = tk.Frame(set_card, bg=THEME["card"])
         r2.pack(fill="x", pady=(0, 6))
@@ -1131,7 +1083,7 @@ class App:
         ).pack(anchor="w", pady=(0, 3))
 
         r3 = tk.Frame(dir_card, bg=THEME["card"])
-        r3.pack(fill="x", pady=(0, 7))
+        r3.pack(fill="x")
         out_pill = SoftPillField(
             r3,
             height=28,
@@ -1157,43 +1109,6 @@ class App:
         self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=72, height=28).pack(side="left", padx=(0, 6))
         self._make_sec_btn(r3, "浏览", self.choose_output, width=68, height=28).pack(side="right")
 
-        tk.Label(
-            dir_card,
-            text="AI 模型存放位置：",
-            bg=THEME["card"],
-            fg=THEME["text"],
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(anchor="w", pady=(0, 3))
-
-        r4 = tk.Frame(dir_card, bg=THEME["card"])
-        r4.pack(fill="x")
-        model_pill = SoftPillField(
-            r4,
-            height=28,
-            radius=14,
-            bg_color="#F8FAFC",
-            border_color="#CBD5E1",
-            parent_bg=THEME["card"],
-            padx=10,
-            pady=3,
-        )
-        model_pill.canvas.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.model_entry = tk.Entry(
-            model_pill.inner,
-            textvariable=self.model_dir,
-            font=("Microsoft YaHei UI", 9),
-            bg="#F8FAFC",
-            fg=THEME["text"],
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=0,
-        )
-        self.model_entry.pack(fill="both", expand=True)
-        self.model_entry.bind("<Return>", self._on_model_entry_confirm)
-        self.model_entry.bind("<FocusOut>", self._on_model_entry_confirm)
-        self._make_sec_btn(r4, "选择目录", self.choose_model_dir, width=90, height=28).pack(side="right")
-
-        # 红框区域：大约空出一行左右的距离，再空一行，然后一个进度条，然后下面的内容
         bottom = tk.Frame(self.root, bg=THEME["bg"])
         bottom.pack(fill="x", padx=14, pady=(0, 10))
 
@@ -1283,25 +1198,6 @@ class App:
         if p:
             self.output_dir.set(p)
 
-    def choose_model_dir(self):
-        initial = self.model_dir.get().strip()
-        init_path = Path(initial).expanduser()
-        while init_path != init_path.parent and not init_path.exists():
-            init_path = init_path.parent
-        p = filedialog.askdirectory(
-            title="选择存放 AI 抠图模型的文件夹（支持逐级点击选择，建议选非 C 盘）",
-            initialdir=str(init_path) if init_path.exists() else None,
-        )
-        if p:
-            self.model_dir.set(p)
-            self.status.set(f"已选择模型目录：{p}")
-
-    def _on_model_entry_confirm(self, _=None):
-        typed = self.model_dir.get().strip()
-        if typed:
-            normalized = str(Path(typed).expanduser())
-            self.model_dir.set(normalized)
-
     def _preset_changed(self, _=None):
         name = self.preset.get()
         if name in PRESETS:
@@ -1324,6 +1220,33 @@ class App:
     def _selected_model_name(self):
         label = self.model_label_var.get()
         return MODEL_OPTIONS.get(label, "birefnet-portrait")
+
+    def download_selected_model(self):
+        """将当前下拉框选中的模型下载到软件自身目录的 .u2net 文件夹中"""
+        if self._is_downloading_model:
+            messagebox.showinfo("提示", "正在下载模型，请稍候。")
+            return
+        if new_session is None:
+            messagebox.showerror("下载失败", "缺少 rembg 组件，请检查打包是否完整。")
+            return
+
+        model_name = self._selected_model_name()
+        os.environ["U2NET_HOME"] = str(APP_MODEL_DIR)
+        APP_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+        self._is_downloading_model = True
+        self.download_model_btn.set_enabled(False)
+        self.start_btn.set_enabled(False)
+        self.status.set(f"正在下载模型 [{model_name}] 到软件目录 ({APP_MODEL_DIR}) ……")
+
+        def _dl_worker():
+            try:
+                new_session(model_name)
+                self.msgq.put(("model_dl_done", True, model_name, str(APP_MODEL_DIR)))
+            except Exception as e:
+                self.msgq.put(("model_dl_done", False, model_name, str(e)))
+
+        threading.Thread(target=_dl_worker, daemon=True).start()
 
     def start(self):
         images = getattr(self, "_images", [])
@@ -1349,24 +1272,23 @@ class App:
             messagebox.showerror("颜色设置错误", str(e))
             return
 
-        chosen_model_str = self.model_dir.get().strip()
-        if not chosen_model_str:
-            messagebox.showwarning("提示", "请输入或选择一个 AI 模型存放目录。")
-            return
-
         try:
             workers = max(1, min(8, int(self.thread_count.get())))
         except Exception:
             workers = 2
 
+        os.environ["U2NET_HOME"] = str(APP_MODEL_DIR)
+        APP_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
         model_name = self._selected_model_name()
         fmt = (self.output_format.get() or "JPG").upper()
         fine_edge = bool(self.fine_edge.get())
         self.start_btn.set_enabled(False)
+        self.download_model_btn.set_enabled(False)
         self.progress.configure(maximum=len(images), value=0)
         threading.Thread(
             target=self._worker,
-            args=(images, out, rgb, fmt, self.max_kb.get(), chosen_model_str, model_name, fine_edge, workers),
+            args=(images, out, rgb, fmt, self.max_kb.get(), model_name, fine_edge, workers),
             daemon=True,
         ).start()
 
@@ -1424,19 +1346,20 @@ class App:
         data = encode_image_under_limit(result, fmt, max_kb)
         target.write_bytes(data)
 
-    def _worker(self, images, out, rgb, fmt, max_kb, chosen_model_str, model_name, fine_edge, workers):
+    def _worker(self, images, out, rgb, fmt, max_kb, model_name, fine_edge, workers):
         if remove is None or new_session is None:
             self.msgq.put(("fatal", "缺少 rembg 组件，请检查打包是否完整。"))
             return
         try:
-            prepare_model_directory(
-                chosen_model_str,
-                status_cb=lambda text: self.msgq.put(("status", text)),
-            )
+            os.environ["U2NET_HOME"] = str(APP_MODEL_DIR)
+            APP_MODEL_DIR.mkdir(parents=True, exist_ok=True)
             self.msgq.put(("status", f"正在加载模型 {model_name}（{workers} 线程并发）……"))
             session = new_session(model_name)
         except Exception as e:
-            self.msgq.put(("fatal", f"AI 模型 [{model_name}] 加载失败：{e}\n可尝试切换其他模型后重试。"))
+            self.msgq.put((
+                "fatal",
+                f"AI 模型 [{model_name}] 加载失败：{e}\n若尚未下载该模型，请先在下拉框选中后点击“下载模型”。",
+            ))
             return
 
         roots = [Path(p) for p in self.input_paths if Path(p).is_dir()]
@@ -1505,16 +1428,29 @@ class App:
                 kind = item[0]
                 if kind == "status":
                     self.status.set(item[1])
+                elif kind == "model_dl_done":
+                    _, ok_flag, m_name, info_str = item
+                    self._is_downloading_model = False
+                    self.download_model_btn.set_enabled(True)
+                    self.start_btn.set_enabled(True)
+                    if ok_flag:
+                        self.status.set(f"模型 [{m_name}] 已下载并就绪（存放于软件目录 .u2net）")
+                        messagebox.showinfo("下载完成", f"模型 [{m_name}] 已下载到：\n{info_str}")
+                    else:
+                        self.status.set(f"模型 [{m_name}] 下载失败")
+                        messagebox.showerror("下载失败", f"模型 [{m_name}] 下载出错：\n{info_str}")
                 elif kind == "progress":
                     _, v, total, msg = item
                     self.progress.configure(value=v)
                     self.status.set(msg)
                 elif kind == "fatal":
                     self.start_btn.set_enabled(True)
+                    self.download_model_btn.set_enabled(True)
                     messagebox.showerror("无法处理", item[1])
                 elif kind == "done":
                     _, ok, total, errors, out = item
                     self.start_btn.set_enabled(True)
+                    self.download_model_btn.set_enabled(True)
                     self.status.set(f"完成：成功 {ok} 张，失败 {len(errors)} 张")
                     msg = f"处理完成！\n成功：{ok}/{total} 张\n输出位置：{out}"
                     if errors:
@@ -1540,6 +1476,7 @@ def main():
         def load_deps():
             global Image, ImageOps, ImageFilter, remove, new_session
             try:
+                os.environ["U2NET_HOME"] = str(APP_MODEL_DIR)
                 load_q.put(("STAGE", 20.0, "正在准备图像解码组件 (Pillow)..."))
                 from PIL import Image as _Image, ImageOps as _ImageOps, ImageFilter as _ImageFilter
                 Image, ImageOps, ImageFilter = _Image, _ImageOps, _ImageFilter
