@@ -7,7 +7,7 @@
 3. 支持在软件内选择模型并点击“下载模型”，支持手动点击“开始批量处理”多线程并发抠图；
 4. 列表每处理完成一张图片，对应条目后方实时显示绿色对号（✓）；
 5. 输出目录根据导入文件夹名称（或导入图片的上一级文件夹名称）自动命名并存放到所选导出位置；
-6. 支持导出 JPG / PNG、大小上限控制、精细边缘模式与及时释放内存保持界面流畅。
+6. 支持导出 JPG / PNG、大小上限控制、精细边缘模式（尽量保留白色/浅色肩膀与衣料）与及时释放内存。
 """
 import gc
 import io
@@ -96,19 +96,6 @@ def get_model_subdir(model_name: str) -> Path:
     return get_fixed_models_root() / model_name
 
 
-def _has_model_weight_file(directory: Path) -> bool:
-    """检查指定目录中是否存在模型权重文件"""
-    if not directory or not directory.exists() or not directory.is_dir():
-        return False
-    try:
-        for f in directory.rglob("*"):
-            if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS:
-                return True
-    except Exception:
-        return False
-    return False
-
-
 def _find_existing_model_file(model_name: str) -> Path | None:
     """
     在固定目录 <软件根目录>\_internal\.u2net\models\<model_name> 下查找模型权重文件；
@@ -118,12 +105,10 @@ def _find_existing_model_file(model_name: str) -> Path | None:
     model_dir = models_root / model_name
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. 优先直接从 <软件根目录>\_internal\.u2net\models\<model_name> 查找
     for f in model_dir.rglob("*"):
         if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS:
             return f
 
-    # 2. 兼容扁平放于 _internal\.u2net 下的同名文件（如 birefnet-portrait.onnx），复制到对应子文件夹
     legacy_u2net = get_app_root_dir() / "_internal" / ".u2net"
     if legacy_u2net.exists() and legacy_u2net.is_dir():
         key_token = model_name.lower().replace("-", "_")
@@ -140,10 +125,7 @@ def _find_existing_model_file(model_name: str) -> Path | None:
 
 
 def prepare_model_env(model_name: str | None = None) -> Path:
-    """
-    固定配置环境变量指向 <软件根目录>\_internal\.u2net\models
-    （若指定 model_name 且存在模型文件，返回对应模型目录路径）。
-    """
+    """固定配置环境变量指向 <软件根目录>\_internal\.u2net\models"""
     models_root = get_fixed_models_root()
     models_root.mkdir(parents=True, exist_ok=True)
     os.environ["U2NET_HOME"] = str(models_root)
@@ -192,11 +174,6 @@ def collect_images(paths):
 
 
 def resolve_output_root_for_image(src: Path, input_paths: list, base_export_dir: Path) -> tuple[Path, Path]:
-    """
-    根据导入的文件夹名称或导入图片的上一级文件夹名称确定输出子文件夹：
-    - 若图片来自某个导入文件夹（例如 .../16/sub/a.jpg），输出根文件夹为 <base_export_dir>/16，相对路径为 sub/a.jpg；
-    - 若直接导入单张或多张图片（例如 .../16/a.jpg），输出根文件夹为 <base_export_dir>/16，相对路径为 a.jpg。
-    """
     roots = [Path(p).resolve() for p in input_paths if Path(p).exists() and Path(p).is_dir()]
     src_resolved = src.resolve()
     matched_roots = [r for r in roots if r == src_resolved or r in src_resolved.parents]
@@ -213,7 +190,6 @@ def resolve_output_root_for_image(src: Path, input_paths: list, base_export_dir:
 
 
 def encode_image_under_limit(image, fmt, max_kb):
-    """按指定格式（JPG / PNG）编码图片；超限时尝试调整画质或逐步缩小尺寸。"""
     fmt_upper = (fmt or "JPG").upper()
     limit = max(1, int(max_kb)) * 1024
     img = image.convert("RGB")
@@ -849,7 +825,7 @@ class App:
         self.input_paths = []
         self._images = []
         self._img_index_map = {}
-        self._img_states = {}  # "pending" | "ok" | "err"
+        self._img_states = {}
         self._is_downloading_model = False
         self._is_running = False
 
@@ -1205,7 +1181,7 @@ class App:
         r_fine.pack(fill="x")
         tk.Checkbutton(
             r_fine,
-            text="精细边缘模式（加强头发丝分离与边缘去白边，耗时更长、内存与 CPU 占用更高）",
+            text="精细边缘模式（保留发丝与浅色衣料/肩膀轮廓，耗时更长、内存与 CPU 占用更高）",
             variable=self.fine_edge,
             bg=THEME["card"],
             fg=THEME["text"],
@@ -1363,7 +1339,6 @@ class App:
         return MODEL_OPTIONS.get(label, "birefnet-portrait")
 
     def download_selected_model(self):
-        """将当前选中的模型下载到固定目录 <软件根目录>\_internal\.u2net\models\<model_name>"""
         if self._is_downloading_model or self._is_running:
             messagebox.showinfo("提示", "当前有任务正在执行，请稍候。")
             return
@@ -1464,22 +1439,24 @@ class App:
                 from PIL import ImageFilter as _flt
                 flt = _flt
 
+            # 保留完整前景轮廓，避免过度腐蚀吃掉浅色肩膀/衣料
             if fine_edge:
-                a_clean = a_ch.filter(flt.MinFilter(size=3)).filter(flt.GaussianBlur(radius=0.5))
+                a_clean = a_ch.filter(flt.GaussianBlur(radius=0.35))
             else:
-                a_clean = a_ch.filter(flt.MinFilter(size=3))
+                a_clean = a_ch
 
             a_px = a_clean.load()
             r_px = r_ch.load()
             g_px = g_ch.load()
             b_px = b_ch.load()
             w, h = cut.size
-            blend = 0.55 if fine_edge else 0.35
+            blend = 0.28 if fine_edge else 0.18
             for y in range(h):
                 for x in range(w):
                     alpha_val = a_px[x, y]
-                    if 0 < alpha_val < 238:
-                        if r_px[x, y] > 190 and g_px[x, y] > 190 and b_px[x, y] > 190:
+                    # 仅对半透明边缘且极亮白边做轻微混合，保护白色/浅色衣料
+                    if 0 < alpha_val < 210:
+                        if r_px[x, y] > 228 and g_px[x, y] > 228 and b_px[x, y] > 228:
                             r_px[x, y] = int(r_px[x, y] * (1 - blend) + rgb[0] * blend)
                             g_px[x, y] = int(g_px[x, y] * (1 - blend) + rgb[1] * blend)
                             b_px[x, y] = int(b_px[x, y] * (1 - blend) + rgb[2] * blend)
