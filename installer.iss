@@ -1,6 +1,6 @@
-; 证件照批量换底色工具_Czq Inno Setup 安装脚本（SHA-256 增量覆盖 + 彻底卸载模型版）
+; 证件照批量换底色工具_Czq Inno Setup 安装脚本（覆盖更新 + 彻底卸载三模型版）
 #define MyAppName "证件照批量换底色工具_Czq"
-#define MyAppVersion "3.1.0.0"
+#define MyAppVersion "3.1.0.1"
 #define MyAppPublisher "Czq"
 #define MyAppExeName "证件照批量换底色工具_Czq.exe"
 #define MyDesktopShortcutName "证件照批量换底色工具"
@@ -21,7 +21,6 @@ SolidCompression=yes
 WizardStyle=modern
 OutputDir=output
 OutputBaseFilename=证件照批量换底色工具_安装程序_Czq
-; 允许覆盖正在运行或只读属性文件时更顺畅
 CloseApplications=yes
 RestartApplications=no
 
@@ -78,10 +77,9 @@ Name: "{app}\_internal\.u2net\models\isnet-general-use"
 Name: "{app}\_internal\.u2net\models\u2net"
 
 [Files]
-; overwritereadonly 确保即便目标文件有只读属性也能覆盖；核心主程序与模型走 SHA-256 校验逻辑
-Source: "dist\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs overwritereadonly; Check: ShouldInstallFile(ExpandConstant('{app}\_internal'), '')
-Source: "dist\{#MyAppName}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion overwritereadonly; Check: ShouldInstallFile('', ExpandConstant('{app}\{#MyAppExeName}'))
-Source: "dist\{#MyAppName}\_internal\.u2net\models\*"; DestDir: "{app}\_internal\.u2net\models"; Flags: ignoreversion recursesubdirs createallsubdirs overwritereadonly skipifsourcedoesntexist; Check: ShouldInstallFile('', ExpandConstant('{app}\_internal\.u2net\models'))
+; overwritereadonly 确保覆盖安装时所有文件都会直接替换为最新版本
+Source: "dist\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs overwritereadonly
+Source: "dist\{#MyAppName}\_internal\.u2net\models\*"; DestDir: "{app}\_internal\.u2net\models"; Flags: ignoreversion recursesubdirs createallsubdirs overwritereadonly skipifsourcedoesntexist
 Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion overwritereadonly
 
 [Icons]
@@ -93,82 +91,11 @@ Name: "{autodesktop}\{#MyDesktopShortcutName}"; Filename: "{app}\{#MyAppExeName}
 Filename: "{app}\{#MyAppExeName}"; Description: "运行 {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
-function GetFileSha256Hex(const FilePath: string): string;
-var
-  PsCmd, OutFile, ResultText: string;
-  ResultCode: Integer;
-begin
-  Result := '';
-  if not FileExists(FilePath) then
-    exit;
-
-  OutFile := ExpandConstant('{tmp}\sha256_check.txt');
-  if FileExists(OutFile) then
-    DeleteFile(OutFile);
-
-  PsCmd := Format(
-    '-NoProfile -ExecutionPolicy Bypass -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath ''%s'').Hash.ToLower()" > "%s"',
-    [FilePath, OutFile]
-  );
-
-  if Exec('powershell.exe', PsCmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-  begin
-    if (ResultCode = 0) and FileExists(OutFile) and LoadStringFromFile(OutFile, ResultText) then
-    begin
-      Result := Trim(ResultText);
-    end;
-  end;
-
-  if FileExists(OutFile) then
-    DeleteFile(OutFile);
-end;
-
-function ShouldInstallFile(const BaseDir: string; const TargetFile: string): Boolean;
-var
-  DstPath, TmpNewFile, ExistingHash, NewHash: string;
-begin
-  { 目录级批量规则直接放行，具体单文件由 Inno Setup 逐项调用 }
-  if (TargetFile = '') or DirExists(TargetFile) then
-  begin
-    Result := True;
-    exit;
-  end;
-
-  DstPath := TargetFile;
-  { 目标文件尚不存在，直接安装 }
-  if not FileExists(DstPath) then
-  begin
-    Result := True;
-    exit;
-  end;
-
-  { 若当前提取阶段无法直接拿到新文件句柄，交由 Inno Setup 默认覆盖 }
-  TmpNewFile := ExpandConstant(CurrentFileName);
-  if (TmpNewFile = '') or (not FileExists(TmpNewFile)) or (CompareText(TmpNewFile, DstPath) = 0) then
-  begin
-    Result := True;
-    exit;
-  end;
-
-  ExistingHash := GetFileSha256Hex(DstPath);
-  NewHash := GetFileSha256Hex(TmpNewFile);
-
-  { 哈希计算失败时保守返回 True（确保覆盖，不漏更）；哈希完全一致则跳过 }
-  if (ExistingHash <> '') and (NewHash <> '') and (CompareText(ExistingHash, NewHash) = 0) then
-  begin
-    Result := False;
-  end
-  else
-  begin
-    Result := True;
-  end;
-end;
-
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
   begin
-    WizardForm.StatusLabel.Caption := '正在校验并更新主程序与三套离线 AI 抠图模型（SHA-256），请稍候...';
+    WizardForm.StatusLabel.Caption := '正在提取并覆盖更新主程序与三套离线 AI 抠图模型（birefnet / isnet / u2net），请稍候...';
     WizardForm.Update;
   end;
 end;
