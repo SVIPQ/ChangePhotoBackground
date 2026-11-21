@@ -80,14 +80,14 @@ jobs:
 
       - name: 6. 使用 PyInstaller 打包主程序（含版本信息）
         run: |
-          pyinstaller --noconfirm --clean --onedir --windowed ^
-            --name "证件照批量换底色工具_Czq" ^
-            --icon "app.ico" ^
-            --version-file "version_info.txt" ^
-            --collect-all tkinterdnd2 ^
-            --collect-all rembg ^
-            --add-data "app.ico;." ^
-            --add-data "build_u2net\.u2net;.u2net" ^
+          pyinstaller --noconfirm --clean --onedir --windowed `
+            --name "证件照批量换底色工具_Czq" `
+            --icon "app.ico" `
+            --version-file "version_info.txt" `
+            --collect-all tkinterdnd2 `
+            --collect-all rembg `
+            --add-data "app.ico;." `
+            --add-data "build_u2net\.u2net;.u2net" `
             "证件照批量换底色.py"
 
       - name: 7. 同步版本号并编译 Inno Setup 安装程序
