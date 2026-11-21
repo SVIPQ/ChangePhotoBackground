@@ -4,11 +4,9 @@
 功能：
 1. 批量导入图片/文件夹（递归扫描子文件夹），支持顶部区域鼠标拖放文件夹/图片并确认；
 2. 固定以当前程序所在根目录为基准，统一从 <软件根目录>\_internal\.u2net\models\<模型名> 读取与下载模型；
-3. 支持“三模型智能融合引擎”统一开关（同时调用 birefnet-portrait + isnet-general-use + u2net 加权平衡互补），
-   也支持一键检测/下载补全全部三个离线模型，并支持命令行 `--download-all-models` 供打包阶段预下载；
-4. 列表每处理完成一张图片，对应条目后方实时显示绿色对号（✓）；
-5. 输出目录根据导入文件夹名称（或导入图片的上一级文件夹名称）自动命名并存放到所选导出位置；
-6. 支持导出 JPG / PNG、大小上限控制、精细边缘模式（尽量保留白色/浅色肩膀与衣料）与及时释放内存。
+3. 低占用智能抠图引擎：默认 birefnet-portrait（发丝细节）+ isnet-general-use（防漏抠兜底），可选叠加 u2net，兼顾干净边缘与低内存/低占用；
+4. 点右上角关闭按钮可彻底退出进程，不再残留后台假死进程；
+5. 窗口宽度拉宽至 920，完整容纳胶囊框与按钮文字，避免截断。
 """
 import gc
 import io
@@ -22,6 +20,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except Exception:
+    np = None
+    HAS_NUMPY = False
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -50,13 +55,13 @@ PRESETS = {
     "灰色": "#D9D9D9",
 }
 
-# 三模型统一配置与融合平衡权重（发丝细节 + 边缘轮廓 + 整体结构互补）
+# 默认双模型协同（低内存占用 + 发丝与主体兼顾），第三模型 u2net 按需启用
 ENSEMBLE_MODELS = [
-    ("birefnet-portrait", 0.50),
-    ("isnet-general-use", 0.30),
-    ("u2net", 0.20),
+    ("birefnet-portrait", 0.75),
+    ("isnet-general-use", 0.25),
 ]
-ALL_MODEL_NAMES = [m[0] for m in ENSEMBLE_MODELS]
+OPTIONAL_THIRD_MODEL = ("u2net", 0.15)
+ALL_MODEL_NAMES = ["birefnet-portrait", "isnet-general-use", "u2net"]
 PRIMARY_FALLBACK_MODEL = "birefnet-portrait"
 
 THEME = {
@@ -81,36 +86,24 @@ THEME = {
 
 
 def get_app_root_dir() -> Path:
-    """获取当前软件所在根目录（兼容打包后 EXE 目录与源码目录）"""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
 
 def get_u2net_home_dir() -> Path:
-    """
-    U2NET_HOME 固定为：<软件根目录>\_internal\.u2net
-    rembg 内部会自动在此目录下拼接 models\<model_name>\，从而指向：
-    <软件根目录>\_internal\.u2net\models\<model_name>\
-    """
     return get_app_root_dir() / "_internal" / ".u2net"
 
 
 def get_fixed_models_root() -> Path:
-    """固定模型存放根目录：<软件根目录>\_internal\.u2net\models"""
     return get_u2net_home_dir() / "models"
 
 
 def get_model_subdir(model_name: str) -> Path:
-    """获取指定模型的专属目录：<软件根目录>\_internal\.u2net\models\<model_name>"""
     return get_fixed_models_root() / model_name
 
 
 def _find_existing_model_file(model_name: str) -> Path | None:
-    """
-    在固定目录 <软件根目录>\_internal\.u2net\models\<model_name> 下查找模型权重文件；
-    若误落在误多拼一层 models\models\<model_name> 或扁平 _internal\.u2net 下，自动归整过来。
-    """
     models_root = get_fixed_models_root()
     model_dir = models_root / model_name
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -119,7 +112,6 @@ def _find_existing_model_file(model_name: str) -> Path | None:
         if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS:
             return f
 
-    # 兼容之前误多拼一层 models 的目录：<软件根目录>\_internal\.u2net\models\models\<model_name>
     wrong_nested_dir = models_root / "models" / model_name
     if wrong_nested_dir.exists() and wrong_nested_dir.is_dir():
         for f in wrong_nested_dir.rglob("*"):
@@ -145,10 +137,6 @@ def _find_existing_model_file(model_name: str) -> Path | None:
 
 
 def prepare_all_models_env() -> Path:
-    """
-    将 U2NET_HOME 固定设为 <软件根目录>\_internal\.u2net，
-    并确保三个模型的专属子目录均已创建并归整好已有模型文件。
-    """
     u2net_home = get_u2net_home_dir()
     models_root = get_fixed_models_root()
     u2net_home.mkdir(parents=True, exist_ok=True)
@@ -163,7 +151,6 @@ def prepare_all_models_env() -> Path:
 
 
 def check_all_models_status() -> tuple[list[str], list[str]]:
-    """返回 (已就绪模型列表, 缺失模型列表)"""
     prepare_all_models_env()
     ready, missing = [], []
     for m_name in ALL_MODEL_NAMES:
@@ -305,12 +292,12 @@ class SoftPillCard:
         self.pill_r = float(radius)
         self.bg_color = bg_color
         self.border_color = border_color
-        self.card_w = 720.0
+        self.card_w = 880.0
         self.card_h = 85.0
 
         self.canvas = tk.Canvas(
             parent,
-            width=720,
+            width=880,
             height=85,
             bg=parent_bg,
             highlightthickness=0,
@@ -324,7 +311,7 @@ class SoftPillCard:
             pady,
             window=self.inner,
             anchor="nw",
-            width=680,
+            width=840,
         )
         self.padx = padx
         self.pady = pady
@@ -383,14 +370,14 @@ class SoftPillField:
         self.pill_r = float(radius)
         self.bg_color = bg_color
         self.border_color = border_color
-        self.field_w = 360.0
+        self.field_w = 480.0
         self.field_h = float(height)
         self.padx = padx
         self.pady = pady
 
         self.canvas = tk.Canvas(
             parent,
-            width=360,
+            width=480,
             height=int(height),
             bg=parent_bg,
             highlightthickness=0,
@@ -402,7 +389,7 @@ class SoftPillField:
             pady,
             window=self.inner,
             anchor="nw",
-            width=340,
+            width=460,
             height=max(14, int(height - pady * 2)),
         )
         self.canvas.bind("<Configure>", self._on_resize)
@@ -451,13 +438,13 @@ class SoftPillProgressBar(tk.Canvas):
     ):
         super().__init__(
             parent,
-            width=720,
+            width=880,
             height=int(height),
             bg=parent_bg,
             highlightthickness=0,
             bd=0,
         )
-        self.bar_w = 720.0
+        self.bar_w = 880.0
         self.bar_h = float(height)
         self.track_color = track_color
         self.fill_color = fill_color
@@ -508,7 +495,7 @@ class SoftPillButton(tk.Canvas):
         parent,
         text,
         command=None,
-        width=118,
+        width=124,
         height=28,
         radius=14,
         bg_color="#EBF3FF",
@@ -659,8 +646,8 @@ class SoftPillBanner(tk.Canvas):
         self,
         parent,
         main_text,
-        height=44,
-        radius=22,
+        height=42,
+        radius=21,
         bg_color="#EFF6FF",
         hover_color="#DBEAFE",
         border_color="#93C5FD",
@@ -669,14 +656,14 @@ class SoftPillBanner(tk.Canvas):
     ):
         super().__init__(
             parent,
-            width=660,
+            width=820,
             height=int(height),
             bg=parent_bg,
             highlightthickness=0,
             bd=0,
         )
         self.banner_main = main_text
-        self.pill_w = 660.0
+        self.pill_w = 820.0
         self.pill_h = float(height)
         self.pill_r = float(radius)
         self.bg_color = bg_color
@@ -804,7 +791,7 @@ class LoadingWindow:
         canvas.create_text(
             230,
             138,
-            text="首次加载三模型 AI 抠图引擎可能需要几十秒，请勿关闭",
+            text="首次加载 AI 抠图引擎可能需要几十秒，请勿关闭",
             fill="#94A3B8",
             font=("Microsoft YaHei UI", 8),
         )
@@ -850,13 +837,13 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_DISPLAY_NAME)
-        win_w, win_h = 780, 690
-        self.root.minsize(720, 640)
+        win_w, win_h = 920, 690
+        self.root.minsize(860, 640)
         self.root.configure(bg=THEME["bg"])
         center_window_on_screen(self.root, win_w, win_h)
 
         default_output_path = str(Path.home() / "Desktop")
-        default_threads = 2
+        default_threads = 1
 
         self.msgq = queue.Queue()
         self.input_paths = []
@@ -865,9 +852,12 @@ class App:
         self._img_states = {}
         self._is_downloading_model = False
         self._is_running = False
+        self._closing = False
+        self._poll_job = None
 
         self.output_dir = tk.StringVar(value=default_output_path)
-        self.use_triple_ensemble = tk.BooleanVar(value=True)
+        self.use_dual_assist = tk.BooleanVar(value=True)
+        self.include_u2net = tk.BooleanVar(value=False)
         self.model_status_var = tk.StringVar(value=self._build_model_status_text())
         self.color = tk.StringVar(value=PRESETS["蓝色（常用）"])
         self.output_format = tk.StringVar(value="JPG")
@@ -876,6 +866,8 @@ class App:
         self.fine_edge = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="拖入文件夹确认后，再点击下方“开始批量处理”")
 
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
         self._setup_styles()
         try:
             self._build()
@@ -883,11 +875,28 @@ class App:
             messagebox.showerror("界面构建错误", traceback.format_exc())
         self._poll()
 
+    def on_close(self):
+        """确保点击右上角关闭按钮后立即彻底结束进程，不残留后台线程/任务管理器进程"""
+        self._closing = True
+        if self._poll_job is not None:
+            try:
+                self.root.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+        try:
+            self.root.withdraw()
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
     def _build_model_status_text(self) -> str:
         ready, missing = check_all_models_status()
         if not missing:
-            return f"离线模型包已完整就绪（{len(ready)}/3）"
-        return f"已就绪 {len(ready)}/3（缺失：{', '.join(missing)}）"
+            return f"离线模型已就绪 ({len(ready)}/3)"
+        return f"已就绪 {len(ready)}/3"
 
     def _refresh_model_status_label(self):
         txt = self._build_model_status_text()
@@ -916,7 +925,7 @@ class App:
         )
         return card.canvas, card.inner
 
-    def _make_sec_btn(self, parent, text, command, width=116, height=28):
+    def _make_sec_btn(self, parent, text, command, width=124, height=28):
         return SoftPillButton(
             parent,
             text=text,
@@ -1099,9 +1108,9 @@ class App:
 
         btn_row = tk.Frame(import_card, bg=THEME["card"])
         btn_row.pack(fill="x", pady=(0, 7))
-        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=116, height=28).pack(side="left", padx=(0, 10))
-        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=128, height=28).pack(side="left")
-        self._make_sec_btn(btn_row, "清空", self.clear, width=96, height=28).pack(side="right")
+        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=124, height=28).pack(side="left", padx=(0, 10))
+        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=136, height=28).pack(side="left")
+        self._make_sec_btn(btn_row, "清空", self.clear, width=104, height=28).pack(side="right")
 
         list_pill = SoftPillField(
             import_card,
@@ -1170,21 +1179,32 @@ class App:
             font=("Microsoft YaHei UI", 9),
         )
         self.hex_label.pack(side="left", padx=(0, 8))
-        self._make_sec_btn(r1, "自定义颜色", self.choose_color, width=116, height=28).pack(side="right")
+        self._make_sec_btn(r1, "自定义颜色", self.choose_color, width=124, height=28).pack(side="right")
 
-        # 统一三模型融合总开关行（替代原三模型下拉单选框）
+        # 模型协同与低占用开关行（拉宽窗口后空间充裕，文字完整显示）
         r_model = tk.Frame(set_card, bg=THEME["card"])
         r_model.pack(fill="x", pady=(0, 6))
         tk.Checkbutton(
             r_model,
-            text="三模型融合平衡引擎（birefnet-portrait + isnet-general-use + u2net 协同加权）",
-            variable=self.use_triple_ensemble,
+            text="isnet 防漏抠兜底",
+            variable=self.use_dual_assist,
             bg=THEME["card"],
             fg=THEME["text"],
             selectcolor="#EFF6FF",
             activebackground=THEME["card"],
             font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(side="left")
+        ).pack(side="left", padx=(0, 14))
+
+        tk.Checkbutton(
+            r_model,
+            text="叠加 u2net（更重）",
+            variable=self.include_u2net,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            selectcolor="#EFF6FF",
+            activebackground=THEME["card"],
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side="left", padx=(0, 14))
 
         _, missing_init = check_all_models_status()
         self.model_status_lbl = tk.Label(
@@ -1192,15 +1212,15 @@ class App:
             textvariable=self.model_status_var,
             bg=THEME["card"],
             fg=THEME["ok_green"] if not missing_init else THEME["err_red"],
-            font=("Microsoft YaHei UI", 8, "bold"),
+            font=("Microsoft YaHei UI", 9, "bold"),
         )
-        self.model_status_lbl.pack(side="left", padx=(6, 6))
+        self.model_status_lbl.pack(side="left")
 
         self.download_model_btn = self._make_sec_btn(
             r_model,
-            "补全三模型",
+            "补全离线模型",
             self.download_all_models_ui,
-            width=108,
+            width=124,
             height=28,
         )
         self.download_model_btn.pack(side="right")
@@ -1233,18 +1253,18 @@ class App:
         ttk.Spinbox(
             r2,
             from_=1,
-            to=8,
+            to=4,
             textvariable=self.thread_count,
             width=8,
             font=("Microsoft YaHei UI", 9),
         ).pack(side="left", padx=(6, 4))
-        tk.Label(r2, text="线程", bg=THEME["card"], fg=THEME["muted"], font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Label(r2, text="线程（建议1~2）", bg=THEME["card"], fg=THEME["muted"], font=("Microsoft YaHei UI", 9)).pack(side="left")
 
         r_fine = tk.Frame(set_card, bg=THEME["card"])
         r_fine.pack(fill="x")
         tk.Checkbutton(
             r_fine,
-            text="精细边缘模式（保留发丝与浅色衣料/肩膀轮廓，耗时更长、内存与 CPU 占用更高）",
+            text="精细发丝去白边（清理发丝浅色杂边，同时保留浅色外套与肩膀轮廓）",
             variable=self.fine_edge,
             bg=THEME["card"],
             fg=THEME["text"],
@@ -1286,13 +1306,12 @@ class App:
             highlightthickness=0,
         )
         self.out_entry.pack(fill="both", expand=True)
-        self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=92, height=28).pack(side="left", padx=(0, 8))
-        self._make_sec_btn(r3, "浏览", self.choose_output, width=92, height=28).pack(side="right")
+        self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=96, height=28).pack(side="left", padx=(0, 8))
+        self._make_sec_btn(r3, "浏览", self.choose_output, width=96, height=28).pack(side="right")
 
         bottom = tk.Frame(self.root, bg=THEME["bg"])
         bottom.pack(fill="x", padx=16, pady=(0, 10))
 
-        tk.Frame(bottom, height=18, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
         tk.Frame(bottom, height=16, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
 
         self.progress = SoftPillProgressBar(
@@ -1315,7 +1334,7 @@ class App:
             bottom,
             text="开始批量处理",
             command=self.start,
-            width=740,
+            width=880,
             height=38,
             radius=19,
             bg_color=THEME["accent"],
@@ -1397,8 +1416,15 @@ class App:
         if value.upper() not in {v.upper() for v in PRESETS.values()}:
             self.preset.set("自定义颜色")
 
+    def _get_selected_model_specs(self):
+        specs = [("birefnet-portrait", 0.75)]
+        if self.use_dual_assist.get():
+            specs.append(("isnet-general-use", 0.25))
+        if self.include_u2net.get():
+            specs.append(OPTIONAL_THIRD_MODEL)
+        return specs
+
     def download_all_models_ui(self):
-        """统一检测并下载全部 3 个模型到固定目录 <软件根目录>\_internal\.u2net\models\<model_name>"""
         if self._is_downloading_model or self._is_running:
             messagebox.showinfo("提示", "当前有任务正在执行，请稍候。")
             return
@@ -1406,13 +1432,13 @@ class App:
             messagebox.showerror("下载失败", "缺少 rembg 组件，请检查打包是否完整。")
             return
 
-        ready, missing = check_all_models_status()
+        _, missing = check_all_models_status()
         models_root = get_fixed_models_root()
         if not missing:
             self._refresh_model_status_label()
             messagebox.showinfo(
                 "模型已完备",
-                f"全部 3 个模型均已内置并就绪，可直接离线使用：\n"
+                f"全部 3 个离线模型均已就绪：\n"
                 f"• birefnet-portrait\n• isnet-general-use\n• u2net\n\n存放目录：{models_root}",
             )
             return
@@ -1420,24 +1446,30 @@ class App:
         self._is_downloading_model = True
         self.download_model_btn.set_enabled(False)
         self.start_btn.set_enabled(False)
-        self.status.set(f"正在统一下载全部 3 个模型到固定目录 ({models_root}) ……")
+        self.status.set(f"正在下载缺失模型到 {models_root} ……")
 
         def _dl_worker():
             try:
                 prepare_all_models_env()
                 for idx, m_name in enumerate(ALL_MODEL_NAMES, 1):
-                    self.msgq.put(("status", f"正在检查/下载模型 ({idx}/3)：[{m_name}] ……"))
+                    if self._closing:
+                        return
+                    if _find_existing_model_file(m_name) is not None:
+                        continue
+                    self.msgq.put(("status", f"正在下载模型 ({idx}/3)：[{m_name}] ……"))
                     sess = new_session(m_name)
                     del sess
                     gc.collect()
-                self.msgq.put(("model_dl_done", True, "全部 3 个模型", str(models_root)))
+                if not self._closing:
+                    self.msgq.put(("model_dl_done", True, "离线模型", str(models_root)))
             except Exception:
-                self.msgq.put(("model_dl_done", False, "三模型集合", traceback.format_exc()))
+                if not self._closing:
+                    self.msgq.put(("model_dl_done", False, "离线模型", traceback.format_exc()))
 
         threading.Thread(target=_dl_worker, daemon=True).start()
 
     def start(self):
-        if self._is_running or self._is_downloading_model:
+        if self._is_running or self._is_downloading_model or self._closing:
             return
         images = list(getattr(self, "_images", []))
         if not images:
@@ -1463,35 +1495,34 @@ class App:
             return
 
         try:
-            workers = max(1, min(8, int(self.thread_count.get())))
+            workers = max(1, min(4, int(self.thread_count.get())))
         except Exception:
-            workers = 2
+            workers = 1
 
         self._img_states = {str(p.resolve()): "pending" for p in images}
         self._refresh_list_view(images)
 
         models_root = prepare_all_models_env()
-        ensemble_enabled = bool(self.use_triple_ensemble.get())
+        target_specs = self._get_selected_model_specs()
         fmt = (self.output_format.get() or "JPG").upper()
         fine_edge = bool(self.fine_edge.get())
         max_kb_val = int(self.max_kb.get())
         input_paths_snapshot = list(self.input_paths)
 
         self._is_running = True
-        mode_desc = "三模型融合平衡引擎" if ensemble_enabled else f"单模型极速模式 ({PRIMARY_FALLBACK_MODEL})"
-        self.status.set(f"正在加载 {mode_desc}（{models_root}）……")
+        mode_desc = "+".join(m[0] for m in target_specs)
+        self.status.set(f"正在加载 [{mode_desc}]（{models_root}）……")
         self.start_btn.set_enabled(False)
         self.download_model_btn.set_enabled(False)
         self.progress.configure(maximum=len(images), value=0)
 
         threading.Thread(
             target=self._worker,
-            args=(images, input_paths_snapshot, base_out, rgb, fmt, max_kb_val, ensemble_enabled, fine_edge, workers),
+            args=(images, input_paths_snapshot, base_out, rgb, fmt, max_kb_val, target_specs, fine_edge, workers),
             daemon=True,
         ).start()
 
     def _run_model_alpha(self, im_rgba, session):
-        """运行单个 rembg 会话并返回同尺寸灰度 Alpha 通道"""
         cut = remove(im_rgba, session=session)
         if not isinstance(cut, Image.Image):
             cut_img = Image.open(io.BytesIO(cut)).convert("RGBA")
@@ -1502,84 +1533,142 @@ class App:
             cut_img.close()
         return alpha
 
-    def _fuse_triple_alphas(self, im_rgba, weighted_sessions):
-        """
-        同时调用三个模型得到各自 Alpha 蒙版并按权重加权融合：
-        - birefnet-portrait (0.50)：精细发丝与半透明边缘
-        - isnet-general-use (0.30)：衣领/肩膀干净轮廓
-        - u2net (0.20)：主体结构完整性兜底，防止局部漏抠
-        """
-        alpha_list = []
-        for _m_name, weight, sess in weighted_sessions:
+    def _fuse_alphas(self, im_rgba, weighted_sessions):
+        chops = ImageChops
+        if chops is None:
+            from PIL import ImageChops as _chops
+            chops = _chops
+
+        portrait_alpha = None
+        support_alphas = []
+
+        for m_name, _weight, sess in weighted_sessions:
             a = self._run_model_alpha(im_rgba, sess)
-            alpha_list.append((weight, a))
+            if m_name == "birefnet-portrait" and portrait_alpha is None:
+                portrait_alpha = a
+            else:
+                support_alphas.append(a)
 
-        if len(alpha_list) == 1:
-            return alpha_list[0][1]
+        if portrait_alpha is None and support_alphas:
+            portrait_alpha = support_alphas.pop(0)
 
+        if not support_alphas:
+            return portrait_alpha
+
+        support_max = support_alphas[0]
+        for other in support_alphas[1:]:
+            next_max = chops.lighter(support_max, other)
+            if support_max is not support_alphas[0]:
+                support_max.close()
+            other.close()
+            support_max = next_max
+
+        flt = ImageFilter
+        if flt is None:
+            from PIL import ImageFilter as _flt
+            flt = _flt
+        support_soft = support_max.filter(flt.GaussianBlur(radius=1.0))
+        if support_max is not support_alphas[0]:
+            support_max.close()
+
+        if HAS_NUMPY:
+            p_arr = np.asarray(portrait_alpha, dtype=np.float32)
+            s_arr = np.asarray(support_soft, dtype=np.float32)
+            weighted = 0.78 * p_arr + 0.22 * s_arr
+            fused_arr = np.clip(np.maximum(weighted, s_arr), 0, 255).astype(np.uint8)
+            fused = Image.fromarray(fused_arr, mode="L")
+        else:
+            w, h = im_rgba.size
+            fused = Image.new("L", (w, h), 0)
+            p_px = portrait_alpha.load()
+            s_px = support_soft.load()
+            f_px = fused.load()
+            for y in range(h):
+                for x in range(w):
+                    pv = p_px[x, y]
+                    sv = s_px[x, y]
+                    val = max(sv, int(0.78 * pv + 0.22 * sv + 0.5))
+                    f_px[x, y] = 255 if val > 255 else (0 if val < 0 else val)
+
+        try:
+            portrait_alpha.close()
+        except Exception:
+            pass
+        try:
+            support_soft.close()
+        except Exception:
+            pass
+        return fused
+
+    def _clean_fringe_and_composite(self, im_rgba, alpha_img, rgb, fine_edge):
+        if HAS_NUMPY:
+            rgba_arr = np.asarray(im_rgba, dtype=np.float32)
+            a_arr = np.asarray(alpha_img, dtype=np.float32)
+            r = rgba_arr[:, :, 0]
+            g = rgba_arr[:, :, 1]
+            b = rgba_arr[:, :, 2]
+
+            edge_mask = (a_arr > 0.0) & (a_arr < 240.0)
+            if np.any(edge_mask):
+                luma = 0.299 * r + 0.587 * g + 0.114 * b
+                edge_ratio = np.clip((240.0 - a_arr) / 240.0, 0.0, 1.0)
+                bright_mask = edge_mask & (luma > 165.0)
+                if np.any(bright_mask):
+                    base_str = 0.45 if fine_edge else 0.28
+                    strength = np.minimum(0.85, base_str + 0.40 * edge_ratio)
+                    r = np.where(bright_mask, r * (1.0 - strength) + rgb[0] * strength, r)
+                    g = np.where(bright_mask, g * (1.0 - strength) + rgb[1] * strength, g)
+                    b = np.where(bright_mask, b * (1.0 - strength) + rgb[2] * strength, b)
+
+                if fine_edge:
+                    soft_mask = edge_mask & (~bright_mask) & (a_arr < 120.0)
+                    if np.any(soft_mask):
+                        strength2 = np.minimum(0.45, 0.22 + 0.22 * edge_ratio)
+                        r = np.where(soft_mask, r * (1.0 - strength2) + rgb[0] * strength2, r)
+                        g = np.where(soft_mask, g * (1.0 - strength2) + rgb[1] * strength2, g)
+                        b = np.where(soft_mask, b * (1.0 - strength2) + rgb[2] * strength2, b)
+
+            alpha_norm = a_arr / 255.0
+            out_r = r * alpha_norm + rgb[0] * (1.0 - alpha_norm)
+            out_g = g * alpha_norm + rgb[1] * (1.0 - alpha_norm)
+            out_b = b * alpha_norm + rgb[2] * (1.0 - alpha_norm)
+            out_arr = np.stack([out_r, out_g, out_b], axis=-1)
+            return Image.fromarray(np.clip(out_arr, 0, 255).astype(np.uint8), mode="RGB")
+
+        r_ch, g_ch, b_ch, _ = im_rgba.split()
+        a_px = alpha_img.load()
+        r_px = r_ch.load()
+        g_px = g_ch.load()
+        b_px = b_ch.load()
         w, h = im_rgba.size
-        fused = Image.new("L", (w, h), 0)
-        fused_px = fused.load()
-        loaded = [(wt, a.load()) for wt, a in alpha_list]
-
         for y in range(h):
             for x in range(w):
-                acc = 0.0
-                for wt, px in loaded:
-                    acc += wt * px[x, y]
-                val = int(acc + 0.5)
-                fused_px[x, y] = 255 if val > 255 else (0 if val < 0 else val)
-
-        for _, a in alpha_list:
-            try:
-                a.close()
-            except Exception:
-                pass
-        return fused
+                alpha_val = a_px[x, y]
+                if 0 < alpha_val < 240:
+                    rv, gv, bv = r_px[x, y], g_px[x, y], b_px[x, y]
+                    luma = 0.299 * rv + 0.587 * gv + 0.114 * bv
+                    edge_ratio = (240.0 - alpha_val) / 240.0
+                    if luma > 165.0:
+                        strength = min(0.85, (0.45 if fine_edge else 0.28) + 0.40 * edge_ratio)
+                        r_px[x, y] = int(rv * (1.0 - strength) + rgb[0] * strength)
+                        g_px[x, y] = int(gv * (1.0 - strength) + rgb[1] * strength)
+                        b_px[x, y] = int(bv * (1.0 - strength) + rgb[2] * strength)
+        cut_cleaned = Image.merge("RGBA", (r_ch, g_ch, b_ch, alpha_img))
+        bg = Image.new("RGBA", cut_cleaned.size, (*rgb, 255))
+        bg.alpha_composite(cut_cleaned)
+        res = bg.convert("RGB")
+        bg.close()
+        cut_cleaned.close()
+        return res
 
     def _process_single_image(self, src: Path, input_paths: list, weighted_sessions, base_out: Path, rgb, fmt, max_kb, fine_edge, ext):
         im = None
         a_ch = None
-        a_clean = None
-        cut_cleaned = None
-        bg = None
         result = None
         try:
             im = ImageOps.exif_transpose(Image.open(src)).convert("RGBA")
-            r_ch, g_ch, b_ch, _ = im.split()
-
-            # 三模型加权融合（或单模型）生成平衡后的 Alpha 通道
-            a_ch = self._fuse_triple_alphas(im, weighted_sessions)
-
-            flt = ImageFilter
-            if flt is None:
-                from PIL import ImageFilter as _flt
-                flt = _flt
-
-            if fine_edge:
-                a_clean = a_ch.filter(flt.GaussianBlur(radius=0.35))
-            else:
-                a_clean = a_ch
-
-            a_px = a_clean.load()
-            r_px = r_ch.load()
-            g_px = g_ch.load()
-            b_px = b_ch.load()
-            w, h = im.size
-            blend = 0.28 if fine_edge else 0.18
-            for y in range(h):
-                for x in range(w):
-                    alpha_val = a_px[x, y]
-                    if 0 < alpha_val < 210:
-                        if r_px[x, y] > 228 and g_px[x, y] > 228 and b_px[x, y] > 228:
-                            r_px[x, y] = int(r_px[x, y] * (1 - blend) + rgb[0] * blend)
-                            g_px[x, y] = int(g_px[x, y] * (1 - blend) + rgb[1] * blend)
-                            b_px[x, y] = int(b_px[x, y] * (1 - blend) + rgb[2] * blend)
-
-            cut_cleaned = Image.merge("RGBA", (r_ch, g_ch, b_ch, a_clean))
-            bg = Image.new("RGBA", cut_cleaned.size, (*rgb, 255))
-            bg.alpha_composite(cut_cleaned)
-            result = bg.convert("RGB")
+            a_ch = self._fuse_alphas(im, weighted_sessions)
+            result = self._clean_fringe_and_composite(im, a_ch, rgb, fine_edge)
 
             out_folder, relative = resolve_output_root_for_image(src, input_paths, base_out)
             target_dir = out_folder / relative.parent
@@ -1591,30 +1680,32 @@ class App:
             target.write_bytes(data)
             return out_folder
         finally:
-            for obj in (result, bg, cut_cleaned, a_clean, a_ch, im):
+            for obj in (result, a_ch, im):
                 if obj is not None:
                     try:
                         obj.close()
                     except Exception:
                         pass
 
-    def _worker(self, images, input_paths, base_out, rgb, fmt, max_kb, ensemble_enabled, fine_edge, workers):
+    def _worker(self, images, input_paths, base_out, rgb, fmt, max_kb, target_specs, fine_edge, workers):
         weighted_sessions = []
+        executor = None
         try:
             if remove is None or new_session is None:
                 self.msgq.put(("fatal", "缺少 rembg 组件，请检查打包是否完整。"))
                 return
 
             models_root = prepare_all_models_env()
-            target_specs = ENSEMBLE_MODELS if ensemble_enabled else [(PRIMARY_FALLBACK_MODEL, 1.0)]
 
             for idx, (m_name, weight) in enumerate(target_specs, 1):
+                if self._closing:
+                    return
                 m_dir = get_model_subdir(m_name)
                 existing_file = _find_existing_model_file(m_name)
                 if existing_file is not None:
-                    self.msgq.put(("status", f"正在加载内置模型 ({idx}/{len(target_specs)})：{m_name} ……"))
+                    self.msgq.put(("status", f"正在加载模型 ({idx}/{len(target_specs)})：{m_name} ……"))
                 else:
-                    self.msgq.put(("status", f"未在本地找到 {m_name}，正在自动下载 ({idx}/{len(target_specs)})……"))
+                    self.msgq.put(("status", f"正在下载模型 ({idx}/{len(target_specs)})：{m_name} ……"))
                 try:
                     sess = new_session(m_name)
                     weighted_sessions.append((m_name, weight, sess))
@@ -1625,9 +1716,12 @@ class App:
                     ))
                     return
 
+            if self._closing:
+                return
+
             self.msgq.put(("refresh_model_status",))
-            engine_tip = "三模型融合引擎" if ensemble_enabled else PRIMARY_FALLBACK_MODEL
-            self.msgq.put(("status", f"{engine_tip} 已就绪，开始 {workers} 线程并发处理 {len(images)} 张图片……"))
+            engine_tip = "+".join(m[0] for m in target_specs)
+            self.msgq.put(("status", f"[{engine_tip}] 已就绪，开始处理 {len(images)} 张图片……"))
 
             ext = ".png" if fmt == "PNG" else ".jpg"
             effective_workers = max(1, min(workers, len(images)))
@@ -1637,62 +1731,71 @@ class App:
             exported_folders = set()
             lock = threading.Lock()
 
-            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                future_map = {
-                    executor.submit(
-                        self._process_single_image,
+            executor = ThreadPoolExecutor(max_workers=effective_workers)
+            future_map = {
+                executor.submit(
+                    self._process_single_image,
+                    src,
+                    input_paths,
+                    weighted_sessions,
+                    base_out,
+                    rgb,
+                    fmt,
+                    max_kb,
+                    fine_edge,
+                    ext,
+                ): src
+                for src in images
+            }
+
+            for fut in as_completed(future_map):
+                if self._closing:
+                    break
+                src = future_map[fut]
+                try:
+                    out_folder = fut.result()
+                    with lock:
+                        ok += 1
+                        done_count += 1
+                        cur_ok = ok
+                        cur_done = done_count
+                        exported_folders.add(str(out_folder))
+                    self.msgq.put((
+                        "item_done",
                         src,
-                        input_paths,
-                        weighted_sessions,
-                        base_out,
-                        rgb,
-                        fmt,
-                        max_kb,
-                        fine_edge,
-                        ext,
-                    ): src
-                    for src in images
-                }
+                        "ok",
+                        cur_done,
+                        len(images),
+                        f"处理中 {cur_done}/{len(images)}（成功 {cur_ok}）：{src.name} ✓",
+                    ))
+                except Exception as e:
+                    with lock:
+                        errors.append(f"{src}: {e}")
+                        done_count += 1
+                        cur_done = done_count
+                    self.msgq.put((
+                        "item_done",
+                        src,
+                        "err",
+                        cur_done,
+                        len(images),
+                        f"处理中 {cur_done}/{len(images)}（失败）：{src.name} ✗",
+                    ))
+                if done_count % 3 == 0:
+                    gc.collect()
 
-                for fut in as_completed(future_map):
-                    src = future_map[fut]
-                    try:
-                        out_folder = fut.result()
-                        with lock:
-                            ok += 1
-                            done_count += 1
-                            cur_ok = ok
-                            cur_done = done_count
-                            exported_folders.add(str(out_folder))
-                        self.msgq.put((
-                            "item_done",
-                            src,
-                            "ok",
-                            cur_done,
-                            len(images),
-                            f"处理中 {cur_done}/{len(images)}（成功 {cur_ok}）：{src.name} ✓",
-                        ))
-                    except Exception as e:
-                        with lock:
-                            errors.append(f"{src}: {e}")
-                            done_count += 1
-                            cur_done = done_count
-                        self.msgq.put((
-                            "item_done",
-                            src,
-                            "err",
-                            cur_done,
-                            len(images),
-                            f"处理中 {cur_done}/{len(images)}（失败）：{src.name} ✗",
-                        ))
-                    if done_count % 5 == 0:
-                        gc.collect()
-
-            summary_out = "；".join(sorted(exported_folders)) if exported_folders else str(base_out)
-            self.msgq.put(("done", ok, len(images), errors, summary_out))
+            if not self._closing:
+                summary_out = "；".join(sorted(exported_folders)) if exported_folders else str(base_out)
+                self.msgq.put(("done", ok, len(images), errors, summary_out))
         except Exception:
-            self.msgq.put(("fatal", f"后台处理线程发生未捕获异常：\n{traceback.format_exc()}"))
+            if not self._closing:
+                self.msgq.put(("fatal", f"后台处理线程发生未捕获异常：\n{traceback.format_exc()}"))
         finally:
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
             for _, _, sess in weighted_sessions:
                 try:
                     del sess
@@ -1702,6 +1805,8 @@ class App:
             gc.collect()
 
     def _poll(self):
+        if self._closing:
+            return
         try:
             while True:
                 item = self.msgq.get_nowait()
@@ -1717,8 +1822,8 @@ class App:
                     self.start_btn.set_enabled(True)
                     self._refresh_model_status_label()
                     if ok_flag:
-                        self.status.set(f"{m_name} 已全部就绪（存放于 {info_str}）")
-                        messagebox.showinfo("下载完成", f"{m_name} 已全部准备就绪，可离线使用：\n{info_str}")
+                        self.status.set(f"{m_name} 已就绪（{info_str}）")
+                        messagebox.showinfo("下载完成", f"{m_name} 已准备就绪：\n{info_str}")
                     else:
                         self.status.set(f"{m_name} 下载失败")
                         messagebox.showerror("下载失败", f"{m_name} 下载出错：\n{info_str}")
@@ -1745,16 +1850,11 @@ class App:
                     messagebox.showinfo("处理完成", msg)
         except queue.Empty:
             pass
-        if self.root.winfo_exists():
-            self.root.after(100, self._poll)
+        if not self._closing and self.root.winfo_exists():
+            self._poll_job = self.root.after(100, self._poll)
 
 
 def cli_download_all_models() -> int:
-    """
-    供打包阶段（如 GitHub Actions 或本地构建脚本）静默调用：
-    python 证件照批量换底色_2.py --download-all-models
-    将全部 3 个模型下载到 <软件根目录>\_internal\.u2net\models\<模型名>\ 中，方便随安装包一起打包。
-    """
     try:
         models_root = prepare_all_models_env()
         print(f"[INFO] 固定模型根目录: {models_root}")
@@ -1802,7 +1902,7 @@ def main():
                 )
                 Image, ImageOps, ImageFilter, ImageChops = _Image, _ImageOps, _ImageFilter, _ImageChops
 
-                load_q.put(("STAGE", 55.0, "正在初始化三模型 AI 抠图引擎 (rembg / onnxruntime)..."))
+                load_q.put(("STAGE", 55.0, "正在初始化 AI 抠图引擎 (rembg / onnxruntime)..."))
                 from rembg import remove as _remove, new_session as _new_session
                 remove, new_session = _remove, _new_session
 
@@ -1815,7 +1915,7 @@ def main():
             if err_msg:
                 messagebox.showerror("启动失败", f"组件加载出错：\n{err_msg}")
                 root.destroy()
-                return
+                os._exit(1)
             root.deiconify()
             App(root)
 
@@ -1866,6 +1966,7 @@ def main():
             messagebox.showerror("启动异常", f"程序启动出错：\n{e}")
         except Exception:
             pass
+        os._exit(1)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
-; 证件照批量换底色工具_Czq Inno Setup 安装脚本（内置三模型离线版）
+; 证件照批量换底色工具_Czq Inno Setup 安装脚本（SHA-256 增量覆盖 + 彻底卸载模型版）
 #define MyAppName "证件照批量换底色工具_Czq"
-#define MyAppVersion "3.0.0.0"
+#define MyAppVersion "3.1.0.0"
 #define MyAppPublisher "Czq"
 #define MyAppExeName "证件照批量换底色工具_Czq.exe"
 #define MyDesktopShortcutName "证件照批量换底色工具"
@@ -21,6 +21,9 @@ SolidCompression=yes
 WizardStyle=modern
 OutputDir=output
 OutputBaseFilename=证件照批量换底色工具_安装程序_Czq
+; 允许覆盖正在运行或只读属性文件时更顺畅
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -54,18 +57,32 @@ Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescripti
 Type: files; Name: "{autodesktop}\{#MyAppName}.lnk"
 Type: files; Name: "{autodesktop}\{#MyDesktopShortcutName}.lnk"
 
+[UninstallDelete]
+; 卸载时彻底清理三个模型及 _internal\.u2net 目录下所有文件与子目录
+Type: files; Name: "{app}\_internal\.u2net\*"
+Type: files; Name: "{app}\_internal\.u2net\models\*"
+Type: files; Name: "{app}\_internal\.u2net\models\birefnet-portrait\*"
+Type: files; Name: "{app}\_internal\.u2net\models\isnet-general-use\*"
+Type: files; Name: "{app}\_internal\.u2net\models\u2net\*"
+Type: filesandordirs; Name: "{app}\_internal\.u2net\models\birefnet-portrait"
+Type: filesandordirs; Name: "{app}\_internal\.u2net\models\isnet-general-use"
+Type: filesandordirs; Name: "{app}\_internal\.u2net\models\u2net"
+Type: filesandordirs; Name: "{app}\_internal\.u2net\models"
+Type: filesandordirs; Name: "{app}\_internal\.u2net"
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Dirs]
-; 预先确保三模型固定存放目录存在，避免无网络环境下首次启动权限或路径异常
+; 预先确保三模型固定存放目录存在
 Name: "{app}\_internal\.u2net\models\birefnet-portrait"
 Name: "{app}\_internal\.u2net\models\isnet-general-use"
 Name: "{app}\_internal\.u2net\models\u2net"
 
 [Files]
-; 打包主程序及 _internal 下的全部运行库与已预下载的三个离线模型
-Source: "dist\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-; 显式保证三模型目录（birefnet-portrait / isnet-general-use / u2net）完整写入安装目录
-Source: "dist\{#MyAppName}\_internal\.u2net\models\*"; DestDir: "{app}\_internal\.u2net\models"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
-Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion
+; overwritereadonly 确保即便目标文件有只读属性也能覆盖；核心主程序与模型走 SHA-256 校验逻辑
+Source: "dist\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs overwritereadonly; Check: ShouldInstallFile(ExpandConstant('{app}\_internal'), '')
+Source: "dist\{#MyAppName}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion overwritereadonly; Check: ShouldInstallFile('', ExpandConstant('{app}\{#MyAppExeName}'))
+Source: "dist\{#MyAppName}\_internal\.u2net\models\*"; DestDir: "{app}\_internal\.u2net\models"; Flags: ignoreversion recursesubdirs createallsubdirs overwritereadonly skipifsourcedoesntexist; Check: ShouldInstallFile('', ExpandConstant('{app}\_internal\.u2net\models'))
+Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion overwritereadonly
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"
@@ -76,11 +93,96 @@ Name: "{autodesktop}\{#MyDesktopShortcutName}"; Filename: "{app}\{#MyAppExeName}
 Filename: "{app}\{#MyAppExeName}"; Description: "运行 {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+function GetFileSha256Hex(const FilePath: string): string;
+var
+  PsCmd, OutFile, ResultText: string;
+  ResultCode: Integer;
+begin
+  Result := '';
+  if not FileExists(FilePath) then
+    exit;
+
+  OutFile := ExpandConstant('{tmp}\sha256_check.txt');
+  if FileExists(OutFile) then
+    DeleteFile(OutFile);
+
+  PsCmd := Format(
+    '-NoProfile -ExecutionPolicy Bypass -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath ''%s'').Hash.ToLower()" > "%s"',
+    [FilePath, OutFile]
+  );
+
+  if Exec('powershell.exe', PsCmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    if (ResultCode = 0) and FileExists(OutFile) and LoadStringFromFile(OutFile, ResultText) then
+    begin
+      Result := Trim(ResultText);
+    end;
+  end;
+
+  if FileExists(OutFile) then
+    DeleteFile(OutFile);
+end;
+
+function ShouldInstallFile(const BaseDir: string; const TargetFile: string): Boolean;
+var
+  DstPath, TmpNewFile, ExistingHash, NewHash: string;
+begin
+  { 目录级批量规则直接放行，具体单文件由 Inno Setup 逐项调用 }
+  if (TargetFile = '') or DirExists(TargetFile) then
+  begin
+    Result := True;
+    exit;
+  end;
+
+  DstPath := TargetFile;
+  { 目标文件尚不存在，直接安装 }
+  if not FileExists(DstPath) then
+  begin
+    Result := True;
+    exit;
+  end;
+
+  { 若当前提取阶段无法直接拿到新文件句柄，交由 Inno Setup 默认覆盖 }
+  TmpNewFile := ExpandConstant(CurrentFileName);
+  if (TmpNewFile = '') or (not FileExists(TmpNewFile)) or (CompareText(TmpNewFile, DstPath) = 0) then
+  begin
+    Result := True;
+    exit;
+  end;
+
+  ExistingHash := GetFileSha256Hex(DstPath);
+  NewHash := GetFileSha256Hex(TmpNewFile);
+
+  { 哈希计算失败时保守返回 True（确保覆盖，不漏更）；哈希完全一致则跳过 }
+  if (ExistingHash <> '') and (NewHash <> '') and (CompareText(ExistingHash, NewHash) = 0) then
+  begin
+    Result := False;
+  end
+  else
+  begin
+    Result := True;
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
   begin
-    WizardForm.StatusLabel.Caption := '正在提取主程序与三套离线 AI 抠图模型（birefnet / isnet / u2net），请稍候...';
+    WizardForm.StatusLabel.Caption := '正在校验并更新主程序与三套离线 AI 抠图模型（SHA-256），请稍候...';
     WizardForm.Update;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  U2NetDir: string;
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    U2NetDir := ExpandConstant('{app}\_internal\.u2net');
+    if DirExists(U2NetDir) then
+    begin
+      DelTree(U2NetDir, True, True, True);
+    end;
   end;
 end;
