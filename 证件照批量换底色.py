@@ -524,8 +524,8 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_DISPLAY_NAME)
-        self.root.geometry("640x820")
-        self.root.minsize(580, 740)
+        self.root.geometry("640x760")
+        self.root.minsize(560, 560)
         self.root.configure(bg=THEME["bg"])
 
         default_model_path = (
@@ -606,7 +606,7 @@ class App:
 
     def _make_card(self, parent, pady=(0, 7)):
         border_box = tk.Frame(parent, bg=THEME["border"], bd=0, highlightthickness=0)
-        border_box.pack(fill="x", padx=16, pady=pady)
+        border_box.pack(fill="x", padx=14, pady=pady)
         inner = tk.Frame(border_box, bg=THEME["card"], bd=0, highlightthickness=0)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
         pad_box = tk.Frame(inner, bg=THEME["card"], bd=0, highlightthickness=0)
@@ -655,9 +655,36 @@ class App:
         )
 
     def _build(self):
+        # 可滚动主容器，避免高 DPI 或窗口较矮时下方控件被裁切看不到
+        scroll_canvas = tk.Canvas(self.root, bg=THEME["bg"], highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=scroll_canvas.yview)
+        scroll_canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        scroll_canvas.pack(side="left", fill="both", expand=True)
+
+        content = tk.Frame(scroll_canvas, bg=THEME["bg"], bd=0, highlightthickness=0)
+        content_win = scroll_canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _sync_scroll_region(_event=None):
+            scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
+
+        def _sync_content_width(event):
+            if event.width > 10:
+                scroll_canvas.itemconfigure(content_win, width=event.width)
+
+        content.bind("<Configure>", _sync_scroll_region)
+        scroll_canvas.bind("<Configure>", _sync_content_width)
+
+        def _on_mousewheel(event):
+            if event.delta:
+                scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        scroll_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
         # 顶部标题区
-        header = ttk.Frame(self.root, style="App.TFrame")
-        header.pack(fill="x", padx=16, pady=(10, 5))
+        header = ttk.Frame(content, style="App.TFrame")
+        header.pack(fill="x", padx=14, pady=(10, 5))
         ttk.Label(header, text=APP_DISPLAY_NAME, style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
@@ -666,14 +693,14 @@ class App:
         ).pack(anchor="w", pady=(2, 0))
 
         # 卡片 1：导入提示 + 胶囊按钮 + 列表框
-        import_card = self._make_card(self.root, pady=(0, 7))
+        import_card = self._make_card(content, pady=(0, 7))
 
-        drop_canvas = tk.Canvas(import_card, height=50, bg=THEME["card"], highlightthickness=0, bd=0)
+        drop_canvas = tk.Canvas(import_card, height=48, bg=THEME["card"], highlightthickness=0, bd=0)
         drop_canvas.pack(fill="x", pady=(0, 6))
 
         def draw_drop(_e=None):
             w = max(60, drop_canvas.winfo_width())
-            h = max(38, drop_canvas.winfo_height())
+            h = max(36, drop_canvas.winfo_height())
             drop_canvas.delete("all")
             create_rounded_rect(
                 drop_canvas,
@@ -731,7 +758,7 @@ class App:
         self.listbox.pack(fill="x", padx=8, pady=4)
 
         # 卡片 2：背景颜色、输出格式、大小上限、线程数与精细边缘开关
-        set_card = self._make_card(self.root, pady=(0, 7))
+        set_card = self._make_card(content, pady=(0, 7))
         ttk.Label(set_card, text="处理参数设置", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 5))
 
         r1 = tk.Frame(set_card, bg=THEME["card"])
@@ -815,7 +842,7 @@ class App:
         lbl_fine.bind("<Button-1>", lambda _e: self.fine_toggle._toggle())
 
         # 卡片 3：输出目录与 AI 模型目录
-        dir_card = self._make_card(self.root, pady=(0, 7))
+        dir_card = self._make_card(content, pady=(0, 7))
         ttk.Label(dir_card, text="输出文件夹（默认桌面，可点击“浏览”或“原目录”修改）", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 3))
 
         r3 = tk.Frame(dir_card, bg=THEME["card"])
@@ -842,8 +869,8 @@ class App:
         self._make_sec_btn(r4, "选择目录", self.choose_model_dir, width=92, height=29).pack(side="right")
 
         # 底部进度条 + 胶囊回弹波动主按钮 + 提示
-        bottom = ttk.Frame(self.root, style="App.TFrame")
-        bottom.pack(fill="x", padx=16, pady=(0, 10))
+        bottom = ttk.Frame(content, style="App.TFrame")
+        bottom.pack(fill="x", padx=14, pady=(0, 12))
 
         self.progress = ttk.Progressbar(
             bottom,
@@ -857,7 +884,7 @@ class App:
             bottom,
             text="开始批量处理",
             command=self.start,
-            width=600,
+            width=580,
             height=46,
             radius=23,
             bg_color=THEME["accent"],
@@ -879,7 +906,7 @@ class App:
             bottom,
             text="提示：默认输出在桌面；模型目录与安装时一致；支持多线程并发处理，原图不会被修改。",
             style="Subtitle.TLabel",
-            wraplength=600,
+            wraplength=580,
         ).pack(anchor="w", pady=(5, 0))
 
     def _add_paths(self, paths):
