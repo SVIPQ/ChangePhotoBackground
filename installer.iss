@@ -19,7 +19,7 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 OutputDir=output
-OutputBaseFilename=证件照批量换底色工具_安装程序_CZQ
+OutputBaseFilename=证件照批量换底色工具_安装程序_Czq
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
