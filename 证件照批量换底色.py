@@ -3,7 +3,7 @@
 证件照批量换底色工具_Czq
 功能：批量导入图片/文件夹（递归扫描子文件夹）、多线程并发 AI 抠图、统一替换底色、
 保留子文件夹结构和文件主名称、支持导出 JPG 或 PNG、支持自定义 AI 模型存放目录、
-支持精细边缘模式（加强头发丝细节）、白蓝圆润卡片与胶囊控件、点击回弹与波动动画。
+支持精细边缘模式（加强头发丝细节）、白蓝清爽界面、无四角尖锐的圆润加载窗与平滑进度条。
 """
 import os
 import sys
@@ -68,8 +68,6 @@ Image = None
 ImageOps = None
 remove = None
 new_session = None
-TkinterDnD = None
-DND_FILES = None
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 PRESETS = {
@@ -83,17 +81,14 @@ PRESETS = {
 THEME = {
     "bg": "#F2F6FC",
     "card": "#FFFFFF",
-    "border": "#D8E3F0",
+    "border": "#CBD5E1",
     "text": "#0F172A",
     "muted": "#64748B",
     "accent": "#2563EB",
     "accent_hover": "#1D4ED8",
-    "accent_disabled": "#93C5FD",
     "btn_sec": "#EBF2FF",
-    "btn_sec_hover": "#DBEAFE",
     "btn_sec_fg": "#1E3A8A",
     "drop_bg": "#EFF6FF",
-    "drop_border": "#93C5FD",
     "drop_fg": "#1E40AF",
     "list_bg": "#F8FAFC",
 }
@@ -167,11 +162,7 @@ def encode_image_under_limit(image, fmt, max_kb):
 
 
 def prepare_model_directory(target_dir_str, status_cb=None):
-    """
-    准备自定义模型存放目录：
-    1. 支持用户手输或点选任意目录（如 D:\\证件照模型\\.u2net）
-    2. 若目标目录尚无模型且打包自带了模型，则自动复制过去，避免重复下载并省出 C 盘空间
-    """
+    """准备自定义模型存放目录，若目标为空且打包自带模型则自动复制。"""
     raw = (target_dir_str or "").strip()
     if not raw:
         raise ValueError("请先填写或选择一个 AI 模型存放目录。")
@@ -195,7 +186,7 @@ def prepare_model_directory(target_dir_str, status_cb=None):
     return target_dir
 
 
-def _rounded_rect_points(x1, y1, x2, y2, r, segments=14):
+def _rounded_rect_points(x1, y1, x2, y2, r, segments=18):
     r = max(0, min(r, (x2 - x1) / 2.0, (y2 - y1) / 2.0))
     if r <= 0:
         return [x1, y1, x2, y1, x2, y2, x1, y2]
@@ -214,257 +205,15 @@ def _rounded_rect_points(x1, y1, x2, y2, r, segments=14):
     return pts
 
 
-def create_rounded_rect(canvas, x1, y1, x2, y2, r=14, **kwargs):
-    pts = _rounded_rect_points(x1, y1, x2, y2, r=r, segments=14)
+def create_rounded_rect(canvas, x1, y1, x2, y2, r=20, **kwargs):
+    pts = _rounded_rect_points(x1, y1, x2, y2, r=r, segments=18)
     return canvas.create_polygon(pts, smooth=False, **kwargs)
 
 
-class SmoothAnimatedButton(tk.Canvas):
-    """圆润胶囊按钮：支持弹性缩放回弹、悬停变色与扩散波动动画"""
-    def __init__(
-        self,
-        parent,
-        text,
-        command=None,
-        width=120,
-        height=30,
-        radius=15,
-        bg_color="#EBF2FF",
-        hover_color="#DBEAFE",
-        fg_color="#1E3A8A",
-        wave_color="#60A5FA",
-        font=("Microsoft YaHei UI", 9, "bold"),
-        parent_bg="#FFFFFF",
-    ):
-        super().__init__(
-            parent,
-            width=width,
-            height=height,
-            bg=parent_bg,
-            highlightthickness=0,
-            bd=0,
-            cursor="hand2",
-        )
-        self.text = text
-        self.command = command
-        self._w = width
-        self._h = height
-        self.radius = radius
-        self.bg_color = bg_color
-        self.hover_color = hover_color
-        self.fg_color = fg_color
-        self.wave_color = wave_color
-        self.font = font
-        self.enabled = True
-        self._hovered = False
-
-        self._scale = 1.0
-        self._vel = 0.0
-        self._spring_job = None
-        self._wave_job = None
-        self._waves = []
-
-        self.bind("<Configure>", self._on_resize)
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
-        self.bind("<ButtonPress-1>", self._on_press)
-        self.bind("<ButtonRelease-1>", self._on_release)
-        self._render()
-
-    def set_state(self, state):
-        self.enabled = (state != "disabled")
-        self.configure(cursor="hand2" if self.enabled else "arrow")
-        self._render()
-
-    def _on_resize(self, event):
-        if event.width > 10 and event.height > 10:
-            self._w = event.width
-            self._h = event.height
-            self._render()
-
-    def _on_enter(self, _event):
-        if not self.enabled:
-            return
-        self._hovered = True
-        self._animate_spring(target_scale=1.02)
-        self._render()
-
-    def _on_leave(self, _event):
-        self._hovered = False
-        self._animate_spring(target_scale=1.0)
-        self._render()
-
-    def _on_press(self, event):
-        if not self.enabled:
-            return
-        self._scale = 0.94
-        self._vel = 0.0
-        max_r = max(self._w, self._h) * 0.85
-        self._waves.append([event.x, event.y, 5.0, max_r, 0])
-        self._waves.append([event.x, event.y, 1.0, max_r * 0.72, -3])
-        self._start_wave_loop()
-        self._render()
-
-    def _on_release(self, event):
-        if not self.enabled:
-            return
-        self._vel = 0.036
-        self._animate_spring(target_scale=1.03 if self._hovered else 1.0)
-        inside = (0 <= event.x <= self._w) and (0 <= event.y <= self._h)
-        if inside and callable(self.command):
-            self.after(65, self.command)
-
-    def _animate_spring(self, target_scale):
-        if self._spring_job is not None:
-            try:
-                self.after_cancel(self._spring_job)
-            except Exception:
-                pass
-            self._spring_job = None
-
-        stiffness = 0.30
-        damping = 0.70
-
-        def step():
-            force = (target_scale - self._scale) * stiffness
-            self._vel = (self._vel + force) * damping
-            self._scale += self._vel
-            self._render()
-            if abs(target_scale - self._scale) > 0.002 or abs(self._vel) > 0.002:
-                self._spring_job = self.after(16, step)
-            else:
-                self._scale = target_scale
-                self._vel = 0.0
-                self._spring_job = None
-                self._render()
-
-        self._spring_job = self.after(16, step)
-
-    def _start_wave_loop(self):
-        if self._wave_job is not None:
-            return
-
-        def wave_step():
-            alive = []
-            for cx, cy, r_val, max_r, tick in self._waves:
-                next_tick = tick + 1
-                if next_tick < 0:
-                    alive.append([cx, cy, r_val, max_r, next_tick])
-                    continue
-                next_r = r_val + max(4.5, (max_r - r_val) * 0.24)
-                if next_r < max_r and next_tick < 20:
-                    alive.append([cx, cy, next_r, max_r, next_tick])
-            self._waves = alive
-            self._render()
-            if self._waves:
-                self._wave_job = self.after(20, wave_step)
-            else:
-                self._wave_job = None
-
-        self._wave_job = self.after(20, wave_step)
-
-    def _render(self):
-        self.delete("all")
-        w, h = self._w, self._h
-        if w <= 4 or h <= 4:
-            return
-
-        if not self.enabled:
-            fill = THEME["accent_disabled"]
-            fg = "#F8FAFC"
-            scale = 1.0
-        else:
-            fill = self.hover_color if self._hovered else self.bg_color
-            fg = self.fg_color
-            scale = self._scale
-
-        box_w = w * scale
-        box_h = h * scale
-        pad_x = (w - box_w) / 2.0 + 1.5
-        pad_y = (h - box_h) / 2.0 + 1.5
-        x1 = pad_x
-        y1 = pad_y
-        x2 = max(x1 + 4, w - pad_x - 1.5)
-        y2 = max(y1 + 4, h - pad_y - 1.5)
-        r = min(self.radius, (x2 - x1) / 2.0, (y2 - y1) / 2.0)
-
-        create_rounded_rect(self, x1, y1, x2, y2, r=r, fill=fill, outline="", width=0)
-
-        for cx, cy, r_val, max_r, tick in self._waves:
-            if tick < 0:
-                continue
-            progress = r_val / max(1.0, max_r)
-            ring_w = max(1.0, 2.5 * (1.0 - progress))
-            create_rounded_rect(
-                self,
-                max(x1 + 1, cx - r_val * 1.35),
-                max(y1 + 1, cy - r_val * 0.75),
-                min(x2 - 1, cx + r_val * 1.35),
-                min(y2 - 1, cy + r_val * 0.75),
-                r=r,
-                fill="",
-                outline=self.wave_color if progress < 0.75 else "#BFDBFE",
-                width=ring_w,
-            )
-
-        self.create_text(w / 2.0, h / 2.0, text=self.text, fill=fg, font=self.font)
-
-
-class PillToggle(tk.Canvas):
-    """胶囊滑动开关组件"""
-    def __init__(self, parent, variable, parent_bg="#FFFFFF"):
-        super().__init__(
-            parent,
-            width=46,
-            height=22,
-            bg=parent_bg,
-            highlightthickness=0,
-            bd=0,
-            cursor="hand2",
-        )
-        self.variable = variable
-        self._pos = 1.0 if bool(variable.get()) else 0.0
-        self._job = None
-        self.bind("<Button-1>", self._toggle)
-        self.variable.trace_add("write", lambda *_: self._start_anim())
-        self._draw()
-
-    def _toggle(self, _event=None):
-        self.variable.set(not bool(self.variable.get()))
-        self._start_anim()
-
-    def _start_anim(self):
-        if self._job is not None:
-            try:
-                self.after_cancel(self._job)
-            except Exception:
-                pass
-            self._job = None
-        target = 1.0 if bool(self.variable.get()) else 0.0
-
-        def step():
-            diff = target - self._pos
-            if abs(diff) > 0.04:
-                self._pos += diff * 0.35
-                self._draw()
-                self._job = self.after(16, step)
-            else:
-                self._pos = target
-                self._draw()
-                self._job = None
-
-        self._job = self.after(16, step)
-
-    def _draw(self):
-        self.delete("all")
-        active = bool(self.variable.get()) or self._pos > 0.5
-        track_fill = THEME["accent"] if active else "#CBD5E1"
-        create_rounded_rect(self, 2, 2, 44, 20, r=9, fill=track_fill, outline="", width=0)
-        knob_x = 4 + self._pos * 20
-        create_rounded_rect(self, knob_x, 4, knob_x + 16, 18, r=7, fill="#FFFFFF", outline="", width=0)
-
-
 class LoadingWindow:
+    """无四角尖锐感、带平滑绿色进度条的启动加载窗"""
+    TRANSPARENT_KEY = "#FF00FF"
+
     def __init__(self, root):
         self.root = root
         self.win = tk.Toplevel(root)
@@ -472,6 +221,11 @@ class LoadingWindow:
         self.win.geometry("420x168")
         self.win.resizable(False, False)
         self.win.overrideredirect(True)
+        self.win.configure(bg=self.TRANSPARENT_KEY)
+        try:
+            self.win.wm_attributes("-transparentcolor", self.TRANSPARENT_KEY)
+        except Exception:
+            pass
         self._center()
 
         style = ttk.Style(self.win)
@@ -486,13 +240,44 @@ class LoadingWindow:
             thickness=14,
         )
 
-        canvas = tk.Canvas(self.win, width=420, height=168, bg="#F2F6FC", highlightthickness=0, bd=0)
+        canvas = tk.Canvas(
+            self.win,
+            width=420,
+            height=168,
+            bg=self.TRANSPARENT_KEY,
+            highlightthickness=0,
+            bd=0,
+        )
         canvas.pack(fill="both", expand=True)
-        create_rounded_rect(canvas, 3, 3, 417, 165, r=20, fill="#FFFFFF", outline="#2563EB", width=2)
 
-        canvas.create_text(210, 38, text=SPLASH_DISPLAY_NAME, fill="#0F172A", font=("Microsoft YaHei UI", 12, "bold"))
+        # 绘制纯圆角卡片底板，外围四角透明，彻底去掉尖锐边角
+        create_rounded_rect(
+            canvas,
+            2,
+            2,
+            418,
+            166,
+            r=24,
+            fill="#FFFFFF",
+            outline="#2563EB",
+            width=2,
+        )
+
+        canvas.create_text(
+            210,
+            38,
+            text=SPLASH_DISPLAY_NAME,
+            fill="#0F172A",
+            font=("Microsoft YaHei UI", 12, "bold"),
+        )
         self.status_var = tk.StringVar(value="正在初始化程序环境，请稍候...")
-        self.status_id = canvas.create_text(210, 66, text=self.status_var.get(), fill="#475569", font=("Microsoft YaHei UI", 9))
+        self.status_id = canvas.create_text(
+            210,
+            66,
+            text=self.status_var.get(),
+            fill="#475569",
+            font=("Microsoft YaHei UI", 9),
+        )
 
         self.bar = ttk.Progressbar(
             canvas,
@@ -543,8 +328,8 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_DISPLAY_NAME)
-        self.root.geometry("620x680")
-        self.root.minsize(560, 620)
+        self.root.geometry("680x860")
+        self.root.minsize(600, 760)
         self.root.configure(bg=THEME["bg"])
 
         default_model_path = (
@@ -577,129 +362,98 @@ class App:
             style.theme_use("clam")
         except Exception:
             pass
-
         style.configure(
             "Blue.Horizontal.TProgressbar",
             troughcolor="#E2E8F0",
             background=THEME["accent"],
-            thickness=8,
+            thickness=10,
         )
 
-    def _make_card(self, parent, pady=(0, 6)):
+    def _make_card(self, parent, pady=(0, 10)):
         outer = tk.Frame(
             parent,
             bg=THEME["card"],
             highlightbackground=THEME["border"],
             highlightthickness=1,
-            bd=0,
         )
-        outer.pack(fill="x", padx=14, pady=pady)
-        inner = tk.Frame(outer, bg=THEME["card"], bd=0, highlightthickness=0)
-        inner.pack(fill="both", expand=True, padx=10, pady=6)
+        outer.pack(fill="x", padx=16, pady=pady)
+        inner = tk.Frame(outer, bg=THEME["card"])
+        inner.pack(fill="both", expand=True, padx=14, pady=10)
         return inner
 
-    def _make_rounded_entry_box(self, parent, textvariable, on_confirm=None):
-        wrap = tk.Frame(
-            parent,
-            bg="#F8FAFC",
-            highlightbackground=THEME["border"],
-            highlightthickness=1,
-            bd=0,
-        )
-        entry = tk.Entry(
-            wrap,
-            textvariable=textvariable,
-            font=("Microsoft YaHei UI", 9),
-            bg="#F8FAFC",
-            fg=THEME["text"],
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            insertbackground=THEME["accent"],
-        )
-        entry.pack(fill="x", expand=True, padx=8, pady=4)
-        if callable(on_confirm):
-            entry.bind("<Return>", on_confirm)
-            entry.bind("<FocusOut>", on_confirm)
-        return wrap, entry
-
-    def _make_sec_btn(self, parent, text, command, width=96, height=28):
-        return SmoothAnimatedButton(
+    def _make_sec_btn(self, parent, text, command, width=10):
+        return tk.Button(
             parent,
             text=text,
             command=command,
             width=width,
-            height=height,
-            radius=height / 2.0,
-            bg_color=THEME["btn_sec"],
-            hover_color=THEME["btn_sec_hover"],
-            fg_color=THEME["btn_sec_fg"],
-            wave_color="#60A5FA",
+            bg=THEME["btn_sec"],
+            fg=THEME["btn_sec_fg"],
+            activebackground="#DBEAFE",
+            activeforeground=THEME["btn_sec_fg"],
+            relief="groove",
+            bd=1,
+            cursor="hand2",
             font=("Microsoft YaHei UI", 9, "bold"),
-            parent_bg=THEME["card"],
         )
 
     def _build(self):
-        # 顶部标题区
-        header = tk.Frame(self.root, bg=THEME["bg"], bd=0, highlightthickness=0)
-        header.pack(fill="x", padx=14, pady=(8, 4))
+        header = tk.Frame(self.root, bg=THEME["bg"])
+        header.pack(fill="x", padx=16, pady=(12, 8))
         tk.Label(
             header,
             text=APP_DISPLAY_NAME,
             bg=THEME["bg"],
             fg=THEME["text"],
-            font=("Microsoft YaHei UI", 14, "bold"),
+            font=("Microsoft YaHei UI", 16, "bold"),
         ).pack(anchor="w")
         tk.Label(
             header,
             text="多线程并发 AI 抠图 · 精细边缘可选 · 保留子文件夹层级与文件名 · 支持 JPG / PNG",
             bg=THEME["bg"],
             fg=THEME["muted"],
-            font=("Microsoft YaHei UI", 8),
-        ).pack(anchor="w", pady=(1, 0))
+            font=("Microsoft YaHei UI", 9),
+        ).pack(anchor="w", pady=(2, 0))
 
-        # 卡片 1：导入提示 + 胶囊按钮 + 列表框
-        import_card = self._make_card(self.root, pady=(0, 6))
-
+        import_card = self._make_card(self.root)
         drop_box = tk.Frame(
             import_card,
             bg=THEME["drop_bg"],
-            highlightbackground=THEME["drop_border"],
+            highlightbackground="#93C5FD",
             highlightthickness=1,
-            bd=0,
         )
-        drop_box.pack(fill="x", pady=(0, 5))
+        drop_box.pack(fill="x", pady=(0, 8))
         tk.Label(
             drop_box,
             text="点击下方“添加照片”或“添加文件夹”选择待处理图片",
             bg=THEME["drop_bg"],
             fg=THEME["drop_fg"],
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(pady=(4, 0))
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(pady=(8, 2))
         tk.Label(
             drop_box,
             text="支持整批照片、总文件夹及多层子文件夹递归扫描",
             bg=THEME["drop_bg"],
             fg="#3B82F6",
             font=("Microsoft YaHei UI", 8),
-        ).pack(pady=(0, 4))
+        ).pack(pady=(0, 8))
 
         btn_row = tk.Frame(import_card, bg=THEME["card"])
-        btn_row.pack(fill="x", pady=(0, 5))
-        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=92, height=28).pack(side="left", padx=(0, 8))
-        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=104, height=28).pack(side="left")
-        self._make_sec_btn(btn_row, "清空", self.clear, width=72, height=28).pack(side="right")
+        btn_row.pack(fill="x", pady=(0, 8))
+        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=11).pack(side="left", padx=(0, 8))
+        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=12).pack(side="left")
+        self._make_sec_btn(btn_row, "清空", self.clear, width=9).pack(side="right")
 
-        list_wrap = tk.Frame(
+        list_frame = tk.Frame(
             import_card,
             bg=THEME["list_bg"],
             highlightbackground=THEME["border"],
             highlightthickness=1,
         )
-        list_wrap.pack(fill="x")
+        list_frame.pack(fill="x")
         self.listbox = tk.Listbox(
-            list_wrap,
-            height=2,
+            list_frame,
+            height=5,
             bg=THEME["list_bg"],
             fg=THEME["text"],
             selectbackground=THEME["accent"],
@@ -709,46 +463,39 @@ class App:
             highlightthickness=0,
             font=("Microsoft YaHei UI", 9),
         )
-        self.listbox.pack(fill="x", padx=8, pady=3)
+        self.listbox.pack(fill="x", padx=6, pady=6)
 
-        # 卡片 2：背景颜色、输出格式、大小上限、线程数与精细边缘开关
-        set_card = self._make_card(self.root, pady=(0, 6))
+        set_card = self._make_card(self.root)
         tk.Label(
             set_card,
             text="处理参数设置",
             bg=THEME["card"],
             fg=THEME["text"],
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(anchor="w", pady=(0, 4))
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 8))
 
         r1 = tk.Frame(set_card, bg=THEME["card"])
-        r1.pack(fill="x", pady=(0, 4))
+        r1.pack(fill="x", pady=(0, 8))
         tk.Label(r1, text="背景颜色：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
         self.preset = ttk.Combobox(
             r1,
             values=list(PRESETS.keys()) + ["自定义颜色"],
             state="readonly",
-            width=14,
+            width=15,
             font=("Microsoft YaHei UI", 9),
         )
         self.preset.set("蓝色（常用）")
         self.preset.pack(side="left", padx=(4, 8))
         self.preset.bind("<<ComboboxSelected>>", self._preset_changed)
 
-        swatch_c = tk.Canvas(r1, width=24, height=20, bg=THEME["card"], highlightthickness=0, bd=0)
-        swatch_c.pack(side="left", padx=(0, 6))
-        self._swatch_id = create_rounded_rect(
-            swatch_c,
-            1,
-            1,
-            23,
-            19,
-            r=6,
-            fill=self.color.get(),
-            outline="#94A3B8",
-            width=1,
+        self.swatch = tk.Label(
+            r1,
+            text="   ",
+            bg=self.color.get(),
+            relief="solid",
+            bd=1,
         )
-        self._swatch_canvas = swatch_c
+        self.swatch.pack(side="left", padx=(0, 6))
 
         self.hex_label = tk.Label(
             r1,
@@ -758,20 +505,20 @@ class App:
             font=("Microsoft YaHei UI", 9),
         )
         self.hex_label.pack(side="left", padx=(0, 8))
-        self._make_sec_btn(r1, "自定义颜色", self.choose_color, width=98, height=27).pack(side="right")
+        self._make_sec_btn(r1, "自定义颜色", self.choose_color, width=12).pack(side="right")
 
         r2 = tk.Frame(set_card, bg=THEME["card"])
-        r2.pack(fill="x", pady=(0, 5))
+        r2.pack(fill="x", pady=(0, 8))
         tk.Label(r2, text="输出格式：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
         self.format_combo = ttk.Combobox(
             r2,
             textvariable=self.output_format,
             values=["JPG", "PNG"],
             state="readonly",
-            width=6,
+            width=7,
             font=("Microsoft YaHei UI", 9),
         )
-        self.format_combo.pack(side="left", padx=(4, 10))
+        self.format_combo.pack(side="left", padx=(4, 12))
 
         tk.Label(r2, text="大小上限：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
         ttk.Spinbox(
@@ -779,9 +526,10 @@ class App:
             from_=10,
             to=2000,
             textvariable=self.max_kb,
-            width=6,
+            width=7,
             font=("Microsoft YaHei UI", 9),
-        ).pack(side="left", padx=(4, 10))
+        ).pack(side="left", padx=(4, 4))
+        tk.Label(r2, text="KB", bg=THEME["card"], fg=THEME["muted"], font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(0, 12))
 
         tk.Label(r2, text="并发线程：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
         ttk.Spinbox(
@@ -789,42 +537,47 @@ class App:
             from_=1,
             to=8,
             textvariable=self.thread_count,
-            width=4,
+            width=5,
             font=("Microsoft YaHei UI", 9),
         ).pack(side="left", padx=(4, 4))
-        tk.Label(r2, text="线程", bg=THEME["card"], fg=THEME["muted"], font=("Microsoft YaHei UI", 8)).pack(side="left")
+        tk.Label(r2, text="线程", bg=THEME["card"], fg=THEME["muted"], font=("Microsoft YaHei UI", 9)).pack(side="left")
 
         r_fine = tk.Frame(set_card, bg=THEME["card"])
         r_fine.pack(fill="x")
-        self.fine_toggle = PillToggle(r_fine, self.fine_edge, parent_bg=THEME["card"])
-        self.fine_toggle.pack(side="left", padx=(0, 8))
-        lbl_fine = tk.Label(
+        tk.Checkbutton(
             r_fine,
             text="精细边缘模式（加强头发丝与边缘过渡，耗时更长、CPU 占用更高）",
+            variable=self.fine_edge,
             bg=THEME["card"],
             fg=THEME["text"],
+            selectcolor="#EFF6FF",
+            activebackground=THEME["card"],
             font=("Microsoft YaHei UI", 9, "bold"),
-            cursor="hand2",
-        )
-        lbl_fine.pack(side="left")
-        lbl_fine.bind("<Button-1>", lambda _e: self.fine_toggle._toggle())
+        ).pack(anchor="w")
 
-        # 卡片 3：输出目录与 AI 模型目录
-        dir_card = self._make_card(self.root, pady=(0, 6))
+        dir_card = self._make_card(self.root)
         tk.Label(
             dir_card,
             text="输出文件夹（默认桌面，可点击“浏览”或“原目录”修改）",
             bg=THEME["card"],
             fg=THEME["text"],
             font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(anchor="w", pady=(0, 2))
+        ).pack(anchor="w", pady=(0, 4))
 
         r3 = tk.Frame(dir_card, bg=THEME["card"])
-        r3.pack(fill="x", pady=(0, 5))
-        out_box, self.out_entry = self._make_rounded_entry_box(r3, self.output_dir)
-        out_box.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=72, height=28).pack(side="left", padx=(0, 6))
-        self._make_sec_btn(r3, "浏览", self.choose_output, width=66, height=28).pack(side="right")
+        r3.pack(fill="x", pady=(0, 8))
+        self.out_entry = tk.Entry(
+            r3,
+            textvariable=self.output_dir,
+            font=("Microsoft YaHei UI", 9),
+            bg="#F8FAFC",
+            fg=THEME["text"],
+            relief="solid",
+            bd=1,
+        )
+        self.out_entry.pack(side="left", fill="x", expand=True, padx=(0, 6), ipady=3)
+        self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=8).pack(side="left", padx=(0, 6))
+        self._make_sec_btn(r3, "浏览", self.choose_output, width=8).pack(side="right")
 
         tk.Label(
             dir_card,
@@ -832,57 +585,57 @@ class App:
             bg=THEME["card"],
             fg=THEME["text"],
             font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(anchor="w", pady=(0, 2))
+        ).pack(anchor="w", pady=(0, 4))
 
         r4 = tk.Frame(dir_card, bg=THEME["card"])
         r4.pack(fill="x")
-        model_box, self.model_entry = self._make_rounded_entry_box(
+        self.model_entry = tk.Entry(
             r4,
-            self.model_dir,
-            on_confirm=self._on_model_entry_confirm,
+            textvariable=self.model_dir,
+            font=("Microsoft YaHei UI", 9),
+            bg="#F8FAFC",
+            fg=THEME["text"],
+            relief="solid",
+            bd=1,
         )
-        model_box.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self._make_sec_btn(r4, "选择目录", self.choose_model_dir, width=88, height=28).pack(side="right")
+        self.model_entry.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=3)
+        self.model_entry.bind("<Return>", self._on_model_entry_confirm)
+        self.model_entry.bind("<FocusOut>", self._on_model_entry_confirm)
+        self._make_sec_btn(r4, "选择目录", self.choose_model_dir, width=10).pack(side="right")
 
-        # 底部进度条 + 胶囊回弹波动主按钮 + 提示
-        bottom = tk.Frame(self.root, bg=THEME["bg"], bd=0, highlightthickness=0)
-        bottom.pack(fill="x", padx=14, pady=(0, 8))
+        bottom = tk.Frame(self.root, bg=THEME["bg"])
+        bottom.pack(fill="x", padx=16, pady=(0, 12))
 
         self.progress = ttk.Progressbar(
             bottom,
             mode="determinate",
             style="Blue.Horizontal.TProgressbar",
         )
-        self.progress.pack(fill="x", pady=(0, 3))
+        self.progress.pack(fill="x", pady=(0, 4))
         tk.Label(
             bottom,
             textvariable=self.status,
             bg=THEME["bg"],
             fg=THEME["muted"],
             font=("Microsoft YaHei UI", 9),
-        ).pack(anchor="w", pady=(0, 5))
+        ).pack(anchor="w", pady=(0, 8))
 
-        self.start_btn = SmoothAnimatedButton(
+        self.start_btn = tk.Button(
             bottom,
             text="开始批量处理",
             command=self.start,
-            width=580,
-            height=42,
-            radius=21,
-            bg_color=THEME["accent"],
-            hover_color=THEME["accent_hover"],
-            fg_color="#FFFFFF",
-            wave_color="#BFDBFE",
+            bg=THEME["accent"],
+            fg="#FFFFFF",
+            activebackground=THEME["accent_hover"],
+            activeforeground="#FFFFFF",
+            disabledforeground="#E2E8F0",
+            relief="flat",
+            bd=0,
+            cursor="hand2",
             font=("Microsoft YaHei UI", 11, "bold"),
-            parent_bg=THEME["bg"],
+            height=2,
         )
         self.start_btn.pack(fill="x")
-
-        def sync_start_btn_width(event):
-            if event.width > 20:
-                self.start_btn.configure(width=event.width)
-
-        bottom.bind("<Configure>", sync_start_btn_width)
 
         tk.Label(
             bottom,
@@ -890,9 +643,9 @@ class App:
             bg=THEME["bg"],
             fg=THEME["muted"],
             font=("Microsoft YaHei UI", 8),
-            wraplength=580,
+            wraplength=640,
             justify="left",
-        ).pack(anchor="w", pady=(4, 0))
+        ).pack(anchor="w", pady=(6, 0))
 
     def _add_paths(self, paths):
         valid = [p for p in paths if Path(p).exists()]
@@ -974,7 +727,7 @@ class App:
 
     def _set_color(self, value):
         self.color.set(value.upper())
-        self._swatch_canvas.itemconfigure(self._swatch_id, fill=value)
+        self.swatch.configure(bg=value)
         self.hex_label.configure(text=value.upper())
         if value.upper() not in {v.upper() for v in PRESETS.values()}:
             self.preset.set("自定义颜色")
@@ -1008,7 +761,7 @@ class App:
 
         fmt = (self.output_format.get() or "JPG").upper()
         fine_edge = bool(self.fine_edge.get())
-        self.start_btn.set_state("disabled")
+        self.start_btn.configure(state="disabled")
         self.progress.configure(maximum=len(images), value=0)
         threading.Thread(
             target=self._worker,
@@ -1139,11 +892,11 @@ class App:
                     self.progress.configure(value=v)
                     self.status.set(msg)
                 elif kind == "fatal":
-                    self.start_btn.set_state("normal")
+                    self.start_btn.configure(state="normal")
                     messagebox.showerror("无法处理", item[1])
                 elif kind == "done":
                     _, ok, total, errors, out = item
-                    self.start_btn.set_state("normal")
+                    self.start_btn.configure(state="normal")
                     self.status.set(f"完成：成功 {ok} 张，失败 {len(errors)} 张")
                     msg = f"处理完成！\n成功：{ok}/{total} 张\n输出位置：{out}"
                     if errors:
@@ -1155,7 +908,7 @@ class App:
 
 
 def main():
-    global Image, ImageOps, remove, new_session, TkinterDnD, DND_FILES
+    global Image, ImageOps, remove, new_session
 
     try:
         root = tk.Tk()
@@ -1164,7 +917,7 @@ def main():
         load_q = queue.Queue()
 
         def load_deps():
-            global Image, ImageOps, remove, new_session, TkinterDnD, DND_FILES
+            global Image, ImageOps, remove, new_session
             try:
                 load_q.put((25, "正在加载图像处理组件 (Pillow)..."))
                 from PIL import Image as _Image, ImageOps as _ImageOps
@@ -1173,8 +926,6 @@ def main():
                 load_q.put((65, "正在加载 AI 抠图引擎 (rembg / onnxruntime)..."))
                 from rembg import remove as _remove, new_session as _new_session
                 remove, new_session = _remove, _new_session
-
-                TkinterDnD, DND_FILES = None, None
 
                 load_q.put((100, "加载完成，正在打开主界面..."))
                 load_q.put(("DONE", None))
