@@ -40,7 +40,10 @@ jobs:
       - name: 6. 打包程序根目录（含自定义图标、离线模型与包元数据）
         shell: pwsh
         run: |
-          $entryScript = Get-ChildItem -Filter "*.py" | Where-Object { $_.Name -notlike "test*" } | Select-Object -First 1
+          $entryScript = Get-ChildItem -Filter "证件照批量换底色.py" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $entryScript) {
+            $entryScript = Get-ChildItem -Filter "*.py" | Where-Object { $_.Name -notlike "test*" } | Select-Object -First 1
+          }
           if (-not $entryScript) {
             throw "未找到主 Python 脚本（*.py）"
           }
@@ -52,8 +55,10 @@ jobs:
             --copy-metadata rembg `
             --copy-metadata onnxruntime `
             --copy-metadata pillow `
+            --copy-metadata pooch `
             --collect-all rembg `
             --collect-all onnxruntime `
+            --collect-all pooch `
             $entryScript.FullName
 
       - name: 7. 安装 Inno Setup 并编译安装程序 EXE
