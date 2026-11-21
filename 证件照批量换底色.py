@@ -1,23 +1,26 @@
 # -*- coding: utf-8 -*-
 """
 证件照批量换底色工具_Czq
-功能：批量导入图片/文件夹（递归扫描子文件夹）、顶部区域鼠标拖放文件夹后手动确认导入、
-手动点击“开始批量处理”执行、多线程并发 AI 抠图（默认 birefnet-portrait 强化人像与发丝细节）、
-支持在软件内选择模型并点击“下载模型”直接保存到软件目录的 .u2net 文件夹、
-统一替换底色、保留子文件夹结构和文件主名称、支持导出 JPG 或 PNG、
-支持精细边缘模式（加强头发丝与边缘去白边）、圆润胶囊白蓝界面与连贯进度条。
+功能：
+1. 批量导入图片/文件夹（递归扫描子文件夹），支持顶部区域鼠标拖放文件夹/图片并确认；
+2. 固定以当前程序所在根目录为基准，统一从 <软件根目录>\_internal\.u2net\models\<模型名> 读取与下载模型；
+3. 支持在软件内选择模型并点击“下载模型”，支持手动点击“开始批量处理”多线程并发抠图；
+4. 列表每处理完成一张图片，对应条目后方实时显示绿色对号（✓）；
+5. 输出目录根据导入文件夹名称（或导入图片的上一级文件夹名称）自动命名并存放到所选导出位置；
+6. 支持导出 JPG / PNG、大小上限控制、精细边缘模式与及时释放内存保持界面流畅。
 """
-import os
-import sys
+import gc
 import io
 import math
-import traceback
-import threading
+import os
 import queue
+import sys
+import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, colorchooser, messagebox
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -35,58 +38,9 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = io.StringIO()
 
-
-def _has_model_files(directory: Path) -> bool:
-    """检查目录内是否已存在模型权重文件"""
-    if not directory or not directory.exists() or not directory.is_dir():
-        return False
-    for f in directory.rglob("*"):
-        if f.is_file() and f.suffix.lower() in {".onnx", ".pth", ".pt", ".bin", ".safetensors"}:
-            return True
-    return False
-
-
-def _detect_bundled_model_dir():
-    """查找打包自带的模型目录（兼容 PyInstaller 6.x _internal/.u2net 与同级 .u2net）"""
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        for candidate in (exe_dir / "_internal" / ".u2net", exe_dir / ".u2net"):
-            if candidate.exists() and candidate.is_dir():
-                return candidate
-    return None
-
-
-def resolve_initial_model_home() -> Path:
-    """
-    确定 U2NET_HOME 根目录：
-    rembg 会在 U2NET_HOME 下查找/创建 .u2net 子目录。
-    若检测到软件目录自带预下载模型，则优先使用包含该 .u2net 的父目录，避免重复下载。
-    """
-    bundled_u2net = _detect_bundled_model_dir()
-    if bundled_u2net is not None and _has_model_files(bundled_u2net):
-        return bundled_u2net.parent
-
-    if getattr(sys, "frozen", False):
-        base_dir = Path(sys.executable).resolve().parent
-    else:
-        base_dir = Path(__file__).resolve().parent
-
-    (base_dir / ".u2net").mkdir(parents=True, exist_ok=True)
-    return base_dir
-
-
-APP_MODEL_HOME = resolve_initial_model_home()
-APP_MODEL_DIR = APP_MODEL_HOME / ".u2net"
-APP_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-os.environ["U2NET_HOME"] = str(APP_MODEL_HOME)
-
-Image = None
-ImageOps = None
-ImageFilter = None
-remove = None
-new_session = None
-
+MODEL_WEIGHT_EXTS = {".onnx", ".pth", ".pt", ".bin", ".safetensors"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
 PRESETS = {
     "蓝色（常用）": "#438EDB",
     "白色": "#FFFFFF",
@@ -117,14 +71,105 @@ THEME = {
     "drop_border": "#93C5FD",
     "drop_fg": "#1E40AF",
     "list_bg": "#F8FAFC",
+    "ok_green": "#16A34A",
+    "err_red": "#DC2626",
 }
+
+
+def get_app_root_dir() -> Path:
+    """获取当前软件所在根目录（兼容打包后 EXE 目录与源码目录）"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def get_fixed_models_root() -> Path:
+    """
+    固定模型存放根目录：<软件根目录>\_internal\.u2net\models
+    每个模型存放在其同名子文件夹下：<软件根目录>\_internal\.u2net\models\<model_name>\
+    """
+    return get_app_root_dir() / "_internal" / ".u2net" / "models"
+
+
+def get_model_subdir(model_name: str) -> Path:
+    """获取指定模型的专属目录：<软件根目录>\_internal\.u2net\models\<model_name>"""
+    return get_fixed_models_root() / model_name
+
+
+def _has_model_weight_file(directory: Path) -> bool:
+    """检查指定目录中是否存在模型权重文件"""
+    if not directory or not directory.exists() or not directory.is_dir():
+        return False
+    try:
+        for f in directory.rglob("*"):
+            if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _find_existing_model_file(model_name: str) -> Path | None:
+    """
+    在固定目录 <软件根目录>\_internal\.u2net\models\<model_name> 下查找模型权重文件；
+    若尚未在该子目录中，也顺便检查同级 _internal\.u2net 下是否有同名文件并归整到对应子文件夹。
+    """
+    models_root = get_fixed_models_root()
+    model_dir = models_root / model_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. 优先直接从 <软件根目录>\_internal\.u2net\models\<model_name> 查找
+    for f in model_dir.rglob("*"):
+        if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS:
+            return f
+
+    # 2. 兼容扁平放于 _internal\.u2net 下的同名文件（如 birefnet-portrait.onnx），复制到对应子文件夹
+    legacy_u2net = get_app_root_dir() / "_internal" / ".u2net"
+    if legacy_u2net.exists() and legacy_u2net.is_dir():
+        key_token = model_name.lower().replace("-", "_")
+        for f in legacy_u2net.iterdir():
+            if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS:
+                fname_norm = f.stem.lower().replace("-", "_")
+                if model_name.lower() in f.stem.lower() or key_token in fname_norm:
+                    dst = model_dir / f.name
+                    if not dst.exists():
+                        dst.write_bytes(f.read_bytes())
+                    return dst
+
+    return None
+
+
+def prepare_model_env(model_name: str | None = None) -> Path:
+    """
+    固定配置环境变量指向 <软件根目录>\_internal\.u2net\models
+    （若指定 model_name 且存在模型文件，返回对应模型目录路径）。
+    """
+    models_root = get_fixed_models_root()
+    models_root.mkdir(parents=True, exist_ok=True)
+    os.environ["U2NET_HOME"] = str(models_root)
+
+    if model_name:
+        model_dir = get_model_subdir(model_name)
+        model_dir.mkdir(parents=True, exist_ok=True)
+        _find_existing_model_file(model_name)
+        return model_dir
+    return models_root
+
+
+APP_MODELS_ROOT = prepare_model_env("birefnet-portrait")
+
+Image = None
+ImageOps = None
+ImageFilter = None
+remove = None
+new_session = None
 
 
 def hex_to_rgb(value):
     value = (value or "").strip().lstrip("#")
     if len(value) != 6:
         raise ValueError("颜色请使用 #RRGGBB 格式，例如 #438EDB")
-    return tuple(int(value[i:i+2], 16) for i in (0, 2, 4))
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
 
 
 def collect_images(paths):
@@ -144,6 +189,27 @@ def collect_images(paths):
             seen.add(key)
             result.append(p)
     return result
+
+
+def resolve_output_root_for_image(src: Path, input_paths: list, base_export_dir: Path) -> tuple[Path, Path]:
+    """
+    根据导入的文件夹名称或导入图片的上一级文件夹名称确定输出子文件夹：
+    - 若图片来自某个导入文件夹（例如 .../16/sub/a.jpg），输出根文件夹为 <base_export_dir>/16，相对路径为 sub/a.jpg；
+    - 若直接导入单张或多张图片（例如 .../16/a.jpg），输出根文件夹为 <base_export_dir>/16，相对路径为 a.jpg。
+    """
+    roots = [Path(p).resolve() for p in input_paths if Path(p).exists() and Path(p).is_dir()]
+    src_resolved = src.resolve()
+    matched_roots = [r for r in roots if r == src_resolved or r in src_resolved.parents]
+
+    if matched_roots:
+        chosen_root = max(matched_roots, key=lambda x: len(x.parts))
+        folder_name = chosen_root.name or "输出照片"
+        rel = src_resolved.relative_to(chosen_root)
+        return base_export_dir / folder_name, rel
+
+    parent_dir = src_resolved.parent
+    folder_name = parent_dir.name or "输出照片"
+    return base_export_dir / folder_name, Path(src_resolved.name)
 
 
 def encode_image_under_limit(image, fmt, max_kb):
@@ -212,7 +278,6 @@ def create_rounded_rect(canvas, x1, y1, x2, y2, r=18, **kwargs):
 
 
 class SoftPillCard:
-    """胶囊圆角卡片容器：用画布绘制大圆角背景，承载内部内容"""
     def __init__(
         self,
         parent,
@@ -291,7 +356,6 @@ class SoftPillCard:
 
 
 class SoftPillField:
-    """圆润胶囊形输入框/列表外框"""
     def __init__(
         self,
         parent,
@@ -364,7 +428,6 @@ class SoftPillField:
 
 
 class SoftPillProgressBar(tk.Canvas):
-    """圆润胶囊形进度条"""
     def __init__(
         self,
         parent,
@@ -427,7 +490,6 @@ class SoftPillProgressBar(tk.Canvas):
 
 
 class SoftPillButton(tk.Canvas):
-    """圆润胶囊按钮：支持悬停变色、按压微缩回弹与轻柔波动"""
     def __init__(
         self,
         parent,
@@ -580,7 +642,6 @@ class SoftPillButton(tk.Canvas):
 
 
 class SoftPillBanner(tk.Canvas):
-    """圆润胶囊形提示框，支持悬停高亮与自适应宽度"""
     def __init__(
         self,
         parent,
@@ -652,7 +713,6 @@ class SoftPillBanner(tk.Canvas):
 
 
 class LoadingWindow:
-    """无四角尖锐感、带连贯绿色进度条的启动加载窗"""
     TRANSPARENT_KEY = "#FF00FF"
 
     def __init__(self, root):
@@ -765,7 +825,6 @@ class LoadingWindow:
 
 
 def center_window_on_screen(win, width: int, height: int):
-    """将窗口居中显示在主屏幕正中央"""
     win.update_idletasks()
     sw = win.winfo_screenwidth()
     sh = win.winfo_screenheight()
@@ -783,13 +842,17 @@ class App:
         self.root.configure(bg=THEME["bg"])
         center_window_on_screen(self.root, win_w, win_h)
 
-        default_output_path = str(Path.home() / "Desktop" / "证件照换底色结果")
+        default_output_path = str(Path.home() / "Desktop")
         default_threads = 2
 
         self.msgq = queue.Queue()
         self.input_paths = []
         self._images = []
+        self._img_index_map = {}
+        self._img_states = {}  # "pending" | "ok" | "err"
         self._is_downloading_model = False
+        self._is_running = False
+
         self.output_dir = tk.StringVar(value=default_output_path)
         self.model_label_var = tk.StringVar(value="人像发丝最佳 (birefnet-portrait)")
         self.color = tk.StringVar(value=PRESETS["蓝色（常用）"])
@@ -843,7 +906,6 @@ class App:
         )
 
     def _parse_dnd_paths(self, raw_data):
-        """解析拖放进来的路径字符串（兼容带空格花括号路径 {D:\\My Photos}）"""
         if not raw_data:
             return []
         items = []
@@ -883,13 +945,42 @@ class App:
             result.extend(self._collect_all_children(child))
         return result
 
+    def _format_list_row(self, p: Path, state: str) -> str:
+        if state == "ok":
+            return f"{p}   ✓"
+        if state == "err":
+            return f"{p}   ✗"
+        return str(p)
+
     def _refresh_list_view(self, images):
         self.listbox.delete(0, tk.END)
-        for p in images[:1000]:
-            self.listbox.insert(tk.END, str(p))
+        self._img_index_map = {}
+        for idx, p in enumerate(images):
+            key = str(p.resolve())
+            self._img_index_map[key] = idx
+            state = self._img_states.get(key, "pending")
+            if idx < 2000:
+                self.listbox.insert(tk.END, self._format_list_row(p, state))
+                if state == "ok":
+                    self.listbox.itemconfig(idx, fg=THEME["ok_green"])
+                elif state == "err":
+                    self.listbox.itemconfig(idx, fg=THEME["err_red"])
+                else:
+                    self.listbox.itemconfig(idx, fg=THEME["text"])
+
+    def _mark_image_state(self, src: Path, state: str):
+        key = str(src.resolve())
+        self._img_states[key] = state
+        idx = self._img_index_map.get(key)
+        if idx is not None and idx < self.listbox.size():
+            self.listbox.delete(idx)
+            self.listbox.insert(idx, self._format_list_row(src, state))
+            if state == "ok":
+                self.listbox.itemconfig(idx, fg=THEME["ok_green"])
+            elif state == "err":
+                self.listbox.itemconfig(idx, fg=THEME["err_red"])
 
     def _enable_full_drop_zone(self, root_container, banner):
-        """拖入文件夹/图片后先扫描并弹窗确认，确认后留在列表，需手动点击“开始批量处理”"""
         if not HAS_DND or DND_FILES is None:
             return
 
@@ -929,10 +1020,7 @@ class App:
                 self.status.set(prev_status)
                 return
 
-            self.input_paths = candidate_paths
-            self._images = candidate_images
-            self._refresh_list_view(candidate_images)
-            self.status.set(f"已确认导入 {len(candidate_images)} 张图片，请点击“开始批量处理”")
+            self._set_images_list(candidate_paths, candidate_images)
 
         for w in self._collect_all_children(root_container):
             try:
@@ -942,6 +1030,13 @@ class App:
                 w.dnd_bind("<<Drop>>", _on_drop)
             except Exception:
                 pass
+
+    def _set_images_list(self, new_input_paths, images):
+        self.input_paths = new_input_paths
+        self._images = images
+        self._img_states = {str(p.resolve()): "pending" for p in images}
+        self._refresh_list_view(images)
+        self.status.set(f"已找到 {len(images)} 张图片，请点击“开始批量处理”")
 
     def _build(self):
         header = tk.Frame(self.root, bg=THEME["bg"])
@@ -958,7 +1053,7 @@ class App:
         import_outer, import_card = self._make_pill_card(self.root, radius=24)
 
         main_hint = (
-            "将整个文件夹拖入此处（整块区域任意位置），确认后手动点击开始"
+            "将整个文件夹或图片拖入此处（整块区域任意位置），确认后手动点击开始"
             if HAS_DND
             else "点击下方“添加照片”或“添加文件夹”选择待处理图片"
         )
@@ -1110,7 +1205,7 @@ class App:
         r_fine.pack(fill="x")
         tk.Checkbutton(
             r_fine,
-            text="精细边缘模式（加强头发丝分离与边缘去白边，耗时更长、CPU 占用更高）",
+            text="精细边缘模式（加强头发丝分离与边缘去白边，耗时更长、内存与 CPU 占用更高）",
             variable=self.fine_edge,
             bg=THEME["card"],
             fg=THEME["text"],
@@ -1122,7 +1217,7 @@ class App:
         _, dir_card = self._make_pill_card(self.root, radius=22, outer_pady=(0, 2))
         tk.Label(
             dir_card,
-            text="输出文件夹",
+            text="导出位置（将自动在所选位置下生成同名文件夹，如导入 16 则导出为 <所选位置>\\16）",
             bg=THEME["card"],
             fg=THEME["text"],
             font=("Microsoft YaHei UI", 9, "bold"),
@@ -1201,22 +1296,20 @@ class App:
 
     def _add_paths(self, paths):
         valid = [p for p in paths if Path(p).exists()]
-        self.input_paths.extend(valid)
-        images = collect_images(self.input_paths)
-        self._refresh_list_view(images)
-        self.status.set(f"已找到 {len(images)} 张图片，请点击“开始批量处理”")
-        self._images = images
+        candidate_paths = self.input_paths + valid
+        images = collect_images(candidate_paths)
+        self._set_images_list(candidate_paths, images)
 
     def use_source_dir_as_output(self):
         if self._images:
             src_dir = str(Path(self._images[0]).resolve().parent)
             self.output_dir.set(src_dir)
-            self.status.set(f"输出目录已设为原目录：{src_dir}")
+            self.status.set(f"导出基准位置已设为：{src_dir}")
         elif self.input_paths:
             p = Path(self.input_paths[0]).resolve()
             src_dir = str(p if p.is_dir() else p.parent)
             self.output_dir.set(src_dir)
-            self.status.set(f"输出目录已设为原目录：{src_dir}")
+            self.status.set(f"导出基准位置已设为：{src_dir}")
         else:
             messagebox.showinfo("提示", "请先添加照片或文件夹，再使用“原目录”。")
 
@@ -1236,12 +1329,13 @@ class App:
     def clear(self):
         self.input_paths = []
         self._images = []
+        self._img_index_map = {}
+        self._img_states = {}
         self.listbox.delete(0, tk.END)
         self.status.set("列表已清空")
 
     def choose_output(self):
-        """选择输出文件夹时，保持所选文件夹名称不变"""
-        p = filedialog.askdirectory(title="选择输出文件夹")
+        p = filedialog.askdirectory(title="选择导出位置（将在此位置下生成同名文件夹）")
         if p:
             self.output_dir.set(str(Path(p)))
 
@@ -1269,49 +1363,53 @@ class App:
         return MODEL_OPTIONS.get(label, "birefnet-portrait")
 
     def download_selected_model(self):
-        """将当前下拉框选中的模型下载到软件目录的 .u2net 文件夹中"""
-        if self._is_downloading_model:
-            messagebox.showinfo("提示", "正在下载模型，请稍候。")
+        """将当前选中的模型下载到固定目录 <软件根目录>\_internal\.u2net\models\<model_name>"""
+        if self._is_downloading_model or self._is_running:
+            messagebox.showinfo("提示", "当前有任务正在执行，请稍候。")
             return
         if new_session is None:
             messagebox.showerror("下载失败", "缺少 rembg 组件，请检查打包是否完整。")
             return
 
         model_name = self._selected_model_name()
-        os.environ["U2NET_HOME"] = str(APP_MODEL_HOME)
-        APP_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        model_dir = prepare_model_env(model_name)
 
         self._is_downloading_model = True
         self.download_model_btn.set_enabled(False)
         self.start_btn.set_enabled(False)
-        self.status.set(f"正在下载模型 [{model_name}] 到软件目录 ({APP_MODEL_DIR}) ……")
+        self.status.set(f"正在下载模型 [{model_name}] 到固定目录 ({model_dir}) ……")
 
         def _dl_worker():
             try:
-                new_session(model_name)
-                self.msgq.put(("model_dl_done", True, model_name, str(APP_MODEL_DIR)))
+                prepare_model_env(model_name)
+                sess = new_session(model_name)
+                del sess
+                gc.collect()
+                self.msgq.put(("model_dl_done", True, model_name, str(model_dir)))
             except Exception:
                 self.msgq.put(("model_dl_done", False, model_name, traceback.format_exc()))
 
         threading.Thread(target=_dl_worker, daemon=True).start()
 
     def start(self):
+        if self._is_running or self._is_downloading_model:
+            return
         images = list(getattr(self, "_images", []))
         if not images:
             messagebox.showwarning("提示", "请先添加照片或文件夹。")
             return
         out_str = self.output_dir.get().strip()
         if not out_str:
-            messagebox.showwarning("提示", "请填写输出文件夹路径。")
+            messagebox.showwarning("提示", "请填写导出位置路径。")
             return
-        out = Path(out_str).expanduser()
-        if out.exists() and not out.is_dir():
-            messagebox.showerror("输出目录错误", f"输出路径指向的是文件：{out}")
+        base_out = Path(out_str).expanduser()
+        if base_out.exists() and not base_out.is_dir():
+            messagebox.showerror("导出位置错误", f"导出路径指向的是文件：{base_out}")
             return
         try:
-            out.mkdir(parents=True, exist_ok=True)
+            base_out.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            messagebox.showerror("输出目录错误", str(e))
+            messagebox.showerror("导出位置错误", str(e))
             return
         try:
             rgb = hex_to_rgb(self.color.get())
@@ -1324,112 +1422,121 @@ class App:
         except Exception:
             workers = 2
 
-        os.environ["U2NET_HOME"] = str(APP_MODEL_HOME)
-        APP_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        self._img_states = {str(p.resolve()): "pending" for p in images}
+        self._refresh_list_view(images)
 
         model_name = self._selected_model_name()
+        model_dir = prepare_model_env(model_name)
         fmt = (self.output_format.get() or "JPG").upper()
         fine_edge = bool(self.fine_edge.get())
         max_kb_val = int(self.max_kb.get())
+        input_paths_snapshot = list(self.input_paths)
 
-        self.status.set(f"已启动任务，正在准备加载模型 [{model_name}]……")
+        self._is_running = True
+        self.status.set(f"正在从固定目录读取模型 [{model_name}]（{model_dir}）……")
         self.start_btn.set_enabled(False)
         self.download_model_btn.set_enabled(False)
         self.progress.configure(maximum=len(images), value=0)
-        self.root.update_idletasks()
 
         threading.Thread(
             target=self._worker,
-            args=(images, out, rgb, fmt, max_kb_val, model_name, fine_edge, workers),
+            args=(images, input_paths_snapshot, base_out, rgb, fmt, max_kb_val, model_name, fine_edge, workers),
             daemon=True,
         ).start()
 
-    def _process_single_image(self, src, session, out, rgb, fmt, max_kb, fine_edge, root_for, ext):
-        with Image.open(src) as im:
-            im = ImageOps.exif_transpose(im).convert("RGBA")
+    def _process_single_image(self, src: Path, input_paths: list, session, base_out: Path, rgb, fmt, max_kb, fine_edge, ext):
+        im = None
+        cut = None
+        cut_cleaned = None
+        bg = None
+        result = None
+        try:
+            im = ImageOps.exif_transpose(Image.open(src)).convert("RGBA")
             cut = remove(im, session=session)
             if not isinstance(cut, Image.Image):
                 cut = Image.open(io.BytesIO(cut)).convert("RGBA")
             else:
                 cut = cut.convert("RGBA")
 
-        r_ch, g_ch, b_ch, a_ch = cut.split()
-        flt = ImageFilter
-        if flt is None:
-            from PIL import ImageFilter as _flt
-            flt = _flt
+            r_ch, g_ch, b_ch, a_ch = cut.split()
+            flt = ImageFilter
+            if flt is None:
+                from PIL import ImageFilter as _flt
+                flt = _flt
 
-        if fine_edge:
-            a_clean = a_ch.filter(flt.MinFilter(size=3))
-            a_clean = a_clean.filter(flt.GaussianBlur(radius=0.5))
-        else:
-            a_clean = a_ch.filter(flt.MinFilter(size=3))
+            if fine_edge:
+                a_clean = a_ch.filter(flt.MinFilter(size=3)).filter(flt.GaussianBlur(radius=0.5))
+            else:
+                a_clean = a_ch.filter(flt.MinFilter(size=3))
 
-        a_px = a_clean.load()
-        r_px = r_ch.load()
-        g_px = g_ch.load()
-        b_px = b_ch.load()
-        w, h = cut.size
-        for y in range(h):
-            for x in range(w):
-                alpha_val = a_px[x, y]
-                if 0 < alpha_val < 238:
-                    if r_px[x, y] > 190 and g_px[x, y] > 190 and b_px[x, y] > 190:
-                        blend = 0.55 if fine_edge else 0.35
-                        r_px[x, y] = int(r_px[x, y] * (1 - blend) + rgb[0] * blend)
-                        g_px[x, y] = int(g_px[x, y] * (1 - blend) + rgb[1] * blend)
-                        b_px[x, y] = int(b_px[x, y] * (1 - blend) + rgb[2] * blend)
+            a_px = a_clean.load()
+            r_px = r_ch.load()
+            g_px = g_ch.load()
+            b_px = b_ch.load()
+            w, h = cut.size
+            blend = 0.55 if fine_edge else 0.35
+            for y in range(h):
+                for x in range(w):
+                    alpha_val = a_px[x, y]
+                    if 0 < alpha_val < 238:
+                        if r_px[x, y] > 190 and g_px[x, y] > 190 and b_px[x, y] > 190:
+                            r_px[x, y] = int(r_px[x, y] * (1 - blend) + rgb[0] * blend)
+                            g_px[x, y] = int(g_px[x, y] * (1 - blend) + rgb[1] * blend)
+                            b_px[x, y] = int(b_px[x, y] * (1 - blend) + rgb[2] * blend)
 
-        cut_cleaned = Image.merge("RGBA", (r_ch, g_ch, b_ch, a_clean))
-        bg = Image.new("RGBA", cut_cleaned.size, (*rgb, 255))
-        bg.alpha_composite(cut_cleaned)
-        result = bg.convert("RGB")
+            cut_cleaned = Image.merge("RGBA", (r_ch, g_ch, b_ch, a_clean))
+            bg = Image.new("RGBA", cut_cleaned.size, (*rgb, 255))
+            bg.alpha_composite(cut_cleaned)
+            result = bg.convert("RGB")
 
-        root = root_for[src]
-        try:
-            relative = src.relative_to(root)
-        except ValueError:
-            relative = Path(src.name)
-        target_dir = out / (relative.parent if root.is_dir() else Path())
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / (src.stem + ext)
-        if target.exists() and src.suffix.lower() != ext:
-            target = target_dir / (src.stem + f"_converted{ext}")
-        data = encode_image_under_limit(result, fmt, max_kb)
-        target.write_bytes(data)
+            out_folder, relative = resolve_output_root_for_image(src, input_paths, base_out)
+            target_dir = out_folder / relative.parent
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / (src.stem + ext)
+            if target.exists() and src.suffix.lower() != ext:
+                target = target_dir / (src.stem + f"_converted{ext}")
+            data = encode_image_under_limit(result, fmt, max_kb)
+            target.write_bytes(data)
+            return out_folder
+        finally:
+            for obj in (result, bg, cut_cleaned, cut, im):
+                if obj is not None:
+                    try:
+                        obj.close()
+                    except Exception:
+                        pass
 
-    def _worker(self, images, out, rgb, fmt, max_kb, model_name, fine_edge, workers):
+    def _worker(self, images, input_paths, base_out, rgb, fmt, max_kb, model_name, fine_edge, workers):
+        session = None
         try:
             if remove is None or new_session is None:
                 self.msgq.put(("fatal", "缺少 rembg 组件，请检查打包是否完整。"))
                 return
 
-            os.environ["U2NET_HOME"] = str(APP_MODEL_HOME)
-            APP_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-            self.msgq.put(("status", f"正在加载模型 {model_name}（目录：{APP_MODEL_DIR}）……"))
+            model_dir = prepare_model_env(model_name)
+            existing_file = _find_existing_model_file(model_name)
+            if existing_file is not None:
+                self.msgq.put(("status", f"已找到本地模型文件：{existing_file.name}，正在加载……"))
+            else:
+                self.msgq.put(("status", f"未在 {model_dir} 找到模型，正在自动下载 [{model_name}]……"))
 
             try:
                 session = new_session(model_name)
             except Exception as e:
                 self.msgq.put((
                     "fatal",
-                    f"AI 模型 [{model_name}] 加载失败：{e}\n若尚未下载该模型，请先在下拉框选中后点击“下载模型”。",
+                    f"AI 模型 [{model_name}] 加载或下载失败：{e}\n固定模型目录：{model_dir}",
                 ))
                 return
 
             self.msgq.put(("status", f"模型已就绪，开始 {workers} 线程并发处理 {len(images)} 张图片……"))
 
-            roots = [Path(p) for p in self.input_paths if Path(p).is_dir()]
-            root_for = {}
-            for f in images:
-                candidates = [r for r in roots if r == f or r in f.parents]
-                root_for[f] = max(candidates, key=lambda x: len(x.parts)) if candidates else f.parent
-
             ext = ".png" if fmt == "PNG" else ".jpg"
-            effective_workers = min(workers, len(images))
+            effective_workers = max(1, min(workers, len(images)))
             ok = 0
             done_count = 0
             errors = []
+            exported_folders = set()
             lock = threading.Lock()
 
             with ThreadPoolExecutor(max_workers=effective_workers) as executor:
@@ -1437,13 +1544,13 @@ class App:
                     executor.submit(
                         self._process_single_image,
                         src,
+                        input_paths,
                         session,
-                        out,
+                        base_out,
                         rgb,
                         fmt,
                         max_kb,
                         fine_edge,
-                        root_for,
                         ext,
                     ): src
                     for src in images
@@ -1452,17 +1559,20 @@ class App:
                 for fut in as_completed(future_map):
                     src = future_map[fut]
                     try:
-                        fut.result()
+                        out_folder = fut.result()
                         with lock:
                             ok += 1
                             done_count += 1
                             cur_ok = ok
                             cur_done = done_count
+                            exported_folders.add(str(out_folder))
                         self.msgq.put((
-                            "progress",
+                            "item_done",
+                            src,
+                            "ok",
                             cur_done,
                             len(images),
-                            f"多线程处理中 {cur_done}/{len(images)}（成功 {cur_ok}）：{src.name}",
+                            f"处理中 {cur_done}/{len(images)}（成功 {cur_ok}）：{src.name} ✓",
                         ))
                     except Exception as e:
                         with lock:
@@ -1470,15 +1580,24 @@ class App:
                             done_count += 1
                             cur_done = done_count
                         self.msgq.put((
-                            "progress",
+                            "item_done",
+                            src,
+                            "err",
                             cur_done,
                             len(images),
-                            f"失败 {cur_done}/{len(images)}：{src.name}",
+                            f"处理中 {cur_done}/{len(images)}（失败）：{src.name} ✗",
                         ))
+                    if done_count % 5 == 0:
+                        gc.collect()
 
-            self.msgq.put(("done", ok, len(images), errors, str(out)))
+            summary_out = "；".join(sorted(exported_folders)) if exported_folders else str(base_out)
+            self.msgq.put(("done", ok, len(images), errors, summary_out))
         except Exception:
             self.msgq.put(("fatal", f"后台处理线程发生未捕获异常：\n{traceback.format_exc()}"))
+        finally:
+            if session is not None:
+                del session
+            gc.collect()
 
     def _poll(self):
         try:
@@ -1493,33 +1612,36 @@ class App:
                     self.download_model_btn.set_enabled(True)
                     self.start_btn.set_enabled(True)
                     if ok_flag:
-                        self.status.set(f"模型 [{m_name}] 已下载并就绪（存放于软件目录 .u2net）")
-                        messagebox.showinfo("下载完成", f"模型 [{m_name}] 已下载到：\n{info_str}")
+                        self.status.set(f"模型 [{m_name}] 已就绪（存放于 {info_str}）")
+                        messagebox.showinfo("下载完成", f"模型 [{m_name}] 已准备就绪：\n{info_str}")
                     else:
                         self.status.set(f"模型 [{m_name}] 下载失败")
                         messagebox.showerror("下载失败", f"模型 [{m_name}] 下载出错：\n{info_str}")
-                elif kind == "progress":
-                    _, v, total, msg = item
+                elif kind == "item_done":
+                    _, src, state, v, total, msg = item
+                    self._mark_image_state(src, state)
                     self.progress.configure(value=v)
                     self.status.set(msg)
                 elif kind == "fatal":
+                    self._is_running = False
                     self.start_btn.set_enabled(True)
                     self.download_model_btn.set_enabled(True)
                     self.status.set("处理中止，请查看错误提示")
                     messagebox.showerror("无法处理", item[1])
                 elif kind == "done":
-                    _, ok, total, errors, out = item
+                    _, ok, total, errors, out_summary = item
+                    self._is_running = False
                     self.start_btn.set_enabled(True)
                     self.download_model_btn.set_enabled(True)
                     self.status.set(f"完成：成功 {ok} 张，失败 {len(errors)} 张")
-                    msg = f"处理完成！\n成功：{ok}/{total} 张\n输出位置：{out}"
+                    msg = f"处理完成！\n成功：{ok}/{total} 张\n导出文件夹：{out_summary}"
                     if errors:
                         msg += "\n\n部分失败原因（最多显示 5 条）：\n" + "\n".join(errors[:5])
                     messagebox.showinfo("处理完成", msg)
         except queue.Empty:
             pass
         if self.root.winfo_exists():
-            self.root.after(120, self._poll)
+            self.root.after(100, self._poll)
 
 
 def main():
@@ -1537,7 +1659,7 @@ def main():
         def load_deps():
             global Image, ImageOps, ImageFilter, remove, new_session
             try:
-                os.environ["U2NET_HOME"] = str(APP_MODEL_HOME)
+                prepare_model_env("birefnet-portrait")
                 load_q.put(("STAGE", 20.0, "正在准备图像解码组件 (Pillow)..."))
                 from PIL import Image as _Image, ImageOps as _ImageOps, ImageFilter as _ImageFilter
                 Image, ImageOps, ImageFilter = _Image, _ImageOps, _ImageFilter

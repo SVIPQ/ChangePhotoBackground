@@ -1,8 +1,9 @@
 ; 证件照批量换底色工具_Czq Inno Setup 安装脚本
 #define MyAppName "证件照批量换底色工具_Czq"
-#define MyAppVersion "2.1.0.4"
+#define MyAppVersion "2.2.0.1"
 #define MyAppPublisher "Czq"
 #define MyAppExeName "证件照批量换底色工具_Czq.exe"
+#define MyDesktopShortcutName "证件照批量换底色工具"
 
 [Setup]
 AppId={{8D6E7B42-4F5B-4C7A-9B2E-1F4A8C3D9E01}
@@ -18,7 +19,7 @@ Compression=lzma2/fast
 SolidCompression=no
 WizardStyle=modern
 OutputDir=output
-OutputBaseFilename=证件照批量换底色工具_安装程序_Czq
+OutputBaseFilename=证件照批量换底色工具_安装程序_CZQ
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -48,6 +49,10 @@ FinishedLabel=安装程序已完成在您的电脑上安装 {#MyAppName}。您�
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescription: "附加图标:"
 
+[InstallDelete]
+Type: files; Name: "{autodesktop}\{#MyAppName}.lnk"
+Type: files; Name: "{autodesktop}\{#MyDesktopShortcutName}.lnk"
+
 [Files]
 Source: "dist\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion
@@ -55,7 +60,7 @@ Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyDesktopShortcutName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "运行 {#MyAppName}"; Flags: nowait postinstall skipifsilent
