@@ -4,7 +4,8 @@
 功能：
 1. 批量导入图片/文件夹（递归扫描子文件夹），支持顶部区域鼠标拖放文件夹/图片并确认；
 2. 固定以当前程序所在根目录为基准，统一从 <软件根目录>\_internal\.u2net\models\<模型名> 读取与下载模型；
-3. 支持在软件内选择模型并点击“下载模型”，支持手动点击“开始批量处理”多线程并发抠图；
+3. 支持“三模型智能融合引擎”统一开关（同时调用 birefnet-portrait + isnet-general-use + u2net 加权平衡互补），
+   也支持一键检测/下载补全全部三个离线模型，并支持命令行 `--download-all-models` 供打包阶段预下载；
 4. 列表每处理完成一张图片，对应条目后方实时显示绿色对号（✓）；
 5. 输出目录根据导入文件夹名称（或导入图片的上一级文件夹名称）自动命名并存放到所选导出位置；
 6. 支持导出 JPG / PNG、大小上限控制、精细边缘模式（尽量保留白色/浅色肩膀与衣料）与及时释放内存。
@@ -49,11 +50,14 @@ PRESETS = {
     "灰色": "#D9D9D9",
 }
 
-MODEL_OPTIONS = {
-    "人像发丝最佳 (birefnet-portrait)": "birefnet-portrait",
-    "高精度通用 (isnet-general-use)": "isnet-general-use",
-    "经典通用 (u2net)": "u2net",
-}
+# 三模型统一配置与融合平衡权重（发丝细节 + 边缘轮廓 + 整体结构互补）
+ENSEMBLE_MODELS = [
+    ("birefnet-portrait", 0.50),
+    ("isnet-general-use", 0.30),
+    ("u2net", 0.20),
+]
+ALL_MODEL_NAMES = [m[0] for m in ENSEMBLE_MODELS]
+PRIMARY_FALLBACK_MODEL = "birefnet-portrait"
 
 THEME = {
     "bg": "#F1F6FD",
@@ -140,10 +144,10 @@ def _find_existing_model_file(model_name: str) -> Path | None:
     return None
 
 
-def prepare_model_env(model_name: str | None = None) -> Path:
+def prepare_all_models_env() -> Path:
     """
     将 U2NET_HOME 固定设为 <软件根目录>\_internal\.u2net，
-    并确保 <软件根目录>\_internal\.u2net\models\<model_name> 存在。
+    并确保三个模型的专属子目录均已创建并归整好已有模型文件。
     """
     u2net_home = get_u2net_home_dir()
     models_root = get_fixed_models_root()
@@ -151,19 +155,31 @@ def prepare_model_env(model_name: str | None = None) -> Path:
     models_root.mkdir(parents=True, exist_ok=True)
     os.environ["U2NET_HOME"] = str(u2net_home)
 
-    if model_name:
-        model_dir = get_model_subdir(model_name)
-        model_dir.mkdir(parents=True, exist_ok=True)
-        _find_existing_model_file(model_name)
-        return model_dir
+    for m_name in ALL_MODEL_NAMES:
+        m_dir = get_model_subdir(m_name)
+        m_dir.mkdir(parents=True, exist_ok=True)
+        _find_existing_model_file(m_name)
     return models_root
 
 
-APP_MODELS_ROOT = prepare_model_env("birefnet-portrait")
+def check_all_models_status() -> tuple[list[str], list[str]]:
+    """返回 (已就绪模型列表, 缺失模型列表)"""
+    prepare_all_models_env()
+    ready, missing = [], []
+    for m_name in ALL_MODEL_NAMES:
+        if _find_existing_model_file(m_name) is not None:
+            ready.append(m_name)
+        else:
+            missing.append(m_name)
+    return ready, missing
+
+
+APP_MODELS_ROOT = prepare_all_models_env()
 
 Image = None
 ImageOps = None
 ImageFilter = None
+ImageChops = None
 remove = None
 new_session = None
 
@@ -788,7 +804,7 @@ class LoadingWindow:
         canvas.create_text(
             230,
             138,
-            text="首次加载 AI 抠图组件可能需要几十秒，请勿关闭",
+            text="首次加载三模型 AI 抠图引擎可能需要几十秒，请勿关闭",
             fill="#94A3B8",
             font=("Microsoft YaHei UI", 8),
         )
@@ -834,8 +850,8 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_DISPLAY_NAME)
-        win_w, win_h = 780, 680
-        self.root.minsize(720, 630)
+        win_w, win_h = 780, 690
+        self.root.minsize(720, 640)
         self.root.configure(bg=THEME["bg"])
         center_window_on_screen(self.root, win_w, win_h)
 
@@ -851,7 +867,8 @@ class App:
         self._is_running = False
 
         self.output_dir = tk.StringVar(value=default_output_path)
-        self.model_label_var = tk.StringVar(value="人像发丝最佳 (birefnet-portrait)")
+        self.use_triple_ensemble = tk.BooleanVar(value=True)
+        self.model_status_var = tk.StringVar(value=self._build_model_status_text())
         self.color = tk.StringVar(value=PRESETS["蓝色（常用）"])
         self.output_format = tk.StringVar(value="JPG")
         self.max_kb = tk.IntVar(value=50)
@@ -865,6 +882,19 @@ class App:
         except Exception:
             messagebox.showerror("界面构建错误", traceback.format_exc())
         self._poll()
+
+    def _build_model_status_text(self) -> str:
+        ready, missing = check_all_models_status()
+        if not missing:
+            return f"离线模型包已完整就绪（{len(ready)}/3）"
+        return f"已就绪 {len(ready)}/3（缺失：{', '.join(missing)}）"
+
+    def _refresh_model_status_label(self):
+        txt = self._build_model_status_text()
+        self.model_status_var.set(txt)
+        _, missing = check_all_models_status()
+        if hasattr(self, "model_status_lbl"):
+            self.model_status_lbl.configure(fg=THEME["ok_green"] if not missing else THEME["err_red"])
 
     def _setup_styles(self):
         style = ttk.Style(self.root)
@@ -1142,23 +1172,35 @@ class App:
         self.hex_label.pack(side="left", padx=(0, 8))
         self._make_sec_btn(r1, "自定义颜色", self.choose_color, width=116, height=28).pack(side="right")
 
+        # 统一三模型融合总开关行（替代原三模型下拉单选框）
         r_model = tk.Frame(set_card, bg=THEME["card"])
         r_model.pack(fill="x", pady=(0, 6))
-        tk.Label(r_model, text="抠图模型：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
-        self.model_combo = ttk.Combobox(
+        tk.Checkbutton(
             r_model,
-            textvariable=self.model_label_var,
-            values=list(MODEL_OPTIONS.keys()),
-            state="readonly",
-            width=44,
-            font=("Microsoft YaHei UI", 9),
+            text="三模型融合平衡引擎（birefnet-portrait + isnet-general-use + u2net 协同加权）",
+            variable=self.use_triple_ensemble,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            selectcolor="#EFF6FF",
+            activebackground=THEME["card"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side="left")
+
+        _, missing_init = check_all_models_status()
+        self.model_status_lbl = tk.Label(
+            r_model,
+            textvariable=self.model_status_var,
+            bg=THEME["card"],
+            fg=THEME["ok_green"] if not missing_init else THEME["err_red"],
+            font=("Microsoft YaHei UI", 8, "bold"),
         )
-        self.model_combo.pack(side="left", padx=(6, 10))
+        self.model_status_lbl.pack(side="left", padx=(6, 6))
+
         self.download_model_btn = self._make_sec_btn(
             r_model,
-            "下载模型",
-            self.download_selected_model,
-            width=116,
+            "补全三模型",
+            self.download_all_models_ui,
+            width=108,
             height=28,
         )
         self.download_model_btn.pack(side="right")
@@ -1355,12 +1397,8 @@ class App:
         if value.upper() not in {v.upper() for v in PRESETS.values()}:
             self.preset.set("自定义颜色")
 
-    def _selected_model_name(self):
-        label = self.model_label_var.get()
-        return MODEL_OPTIONS.get(label, "birefnet-portrait")
-
-    def download_selected_model(self):
-        """将当前选中的模型下载到固定目录 <软件根目录>\_internal\.u2net\models\<model_name>"""
+    def download_all_models_ui(self):
+        """统一检测并下载全部 3 个模型到固定目录 <软件根目录>\_internal\.u2net\models\<model_name>"""
         if self._is_downloading_model or self._is_running:
             messagebox.showinfo("提示", "当前有任务正在执行，请稍候。")
             return
@@ -1368,23 +1406,33 @@ class App:
             messagebox.showerror("下载失败", "缺少 rembg 组件，请检查打包是否完整。")
             return
 
-        model_name = self._selected_model_name()
-        model_dir = prepare_model_env(model_name)
+        ready, missing = check_all_models_status()
+        models_root = get_fixed_models_root()
+        if not missing:
+            self._refresh_model_status_label()
+            messagebox.showinfo(
+                "模型已完备",
+                f"全部 3 个模型均已内置并就绪，可直接离线使用：\n"
+                f"• birefnet-portrait\n• isnet-general-use\n• u2net\n\n存放目录：{models_root}",
+            )
+            return
 
         self._is_downloading_model = True
         self.download_model_btn.set_enabled(False)
         self.start_btn.set_enabled(False)
-        self.status.set(f"正在下载模型 [{model_name}] 到固定目录 ({model_dir}) ……")
+        self.status.set(f"正在统一下载全部 3 个模型到固定目录 ({models_root}) ……")
 
         def _dl_worker():
             try:
-                prepare_model_env(model_name)
-                sess = new_session(model_name)
-                del sess
-                gc.collect()
-                self.msgq.put(("model_dl_done", True, model_name, str(model_dir)))
+                prepare_all_models_env()
+                for idx, m_name in enumerate(ALL_MODEL_NAMES, 1):
+                    self.msgq.put(("status", f"正在检查/下载模型 ({idx}/3)：[{m_name}] ……"))
+                    sess = new_session(m_name)
+                    del sess
+                    gc.collect()
+                self.msgq.put(("model_dl_done", True, "全部 3 个模型", str(models_root)))
             except Exception:
-                self.msgq.put(("model_dl_done", False, model_name, traceback.format_exc()))
+                self.msgq.put(("model_dl_done", False, "三模型集合", traceback.format_exc()))
 
         threading.Thread(target=_dl_worker, daemon=True).start()
 
@@ -1422,40 +1470,87 @@ class App:
         self._img_states = {str(p.resolve()): "pending" for p in images}
         self._refresh_list_view(images)
 
-        model_name = self._selected_model_name()
-        model_dir = prepare_model_env(model_name)
+        models_root = prepare_all_models_env()
+        ensemble_enabled = bool(self.use_triple_ensemble.get())
         fmt = (self.output_format.get() or "JPG").upper()
         fine_edge = bool(self.fine_edge.get())
         max_kb_val = int(self.max_kb.get())
         input_paths_snapshot = list(self.input_paths)
 
         self._is_running = True
-        self.status.set(f"正在从固定目录读取模型 [{model_name}]（{model_dir}）……")
+        mode_desc = "三模型融合平衡引擎" if ensemble_enabled else f"单模型极速模式 ({PRIMARY_FALLBACK_MODEL})"
+        self.status.set(f"正在加载 {mode_desc}（{models_root}）……")
         self.start_btn.set_enabled(False)
         self.download_model_btn.set_enabled(False)
         self.progress.configure(maximum=len(images), value=0)
 
         threading.Thread(
             target=self._worker,
-            args=(images, input_paths_snapshot, base_out, rgb, fmt, max_kb_val, model_name, fine_edge, workers),
+            args=(images, input_paths_snapshot, base_out, rgb, fmt, max_kb_val, ensemble_enabled, fine_edge, workers),
             daemon=True,
         ).start()
 
-    def _process_single_image(self, src: Path, input_paths: list, session, base_out: Path, rgb, fmt, max_kb, fine_edge, ext):
+    def _run_model_alpha(self, im_rgba, session):
+        """运行单个 rembg 会话并返回同尺寸灰度 Alpha 通道"""
+        cut = remove(im_rgba, session=session)
+        if not isinstance(cut, Image.Image):
+            cut_img = Image.open(io.BytesIO(cut)).convert("RGBA")
+        else:
+            cut_img = cut.convert("RGBA")
+        alpha = cut_img.split()[3]
+        if cut_img is not cut:
+            cut_img.close()
+        return alpha
+
+    def _fuse_triple_alphas(self, im_rgba, weighted_sessions):
+        """
+        同时调用三个模型得到各自 Alpha 蒙版并按权重加权融合：
+        - birefnet-portrait (0.50)：精细发丝与半透明边缘
+        - isnet-general-use (0.30)：衣领/肩膀干净轮廓
+        - u2net (0.20)：主体结构完整性兜底，防止局部漏抠
+        """
+        alpha_list = []
+        for _m_name, weight, sess in weighted_sessions:
+            a = self._run_model_alpha(im_rgba, sess)
+            alpha_list.append((weight, a))
+
+        if len(alpha_list) == 1:
+            return alpha_list[0][1]
+
+        w, h = im_rgba.size
+        fused = Image.new("L", (w, h), 0)
+        fused_px = fused.load()
+        loaded = [(wt, a.load()) for wt, a in alpha_list]
+
+        for y in range(h):
+            for x in range(w):
+                acc = 0.0
+                for wt, px in loaded:
+                    acc += wt * px[x, y]
+                val = int(acc + 0.5)
+                fused_px[x, y] = 255 if val > 255 else (0 if val < 0 else val)
+
+        for _, a in alpha_list:
+            try:
+                a.close()
+            except Exception:
+                pass
+        return fused
+
+    def _process_single_image(self, src: Path, input_paths: list, weighted_sessions, base_out: Path, rgb, fmt, max_kb, fine_edge, ext):
         im = None
-        cut = None
+        a_ch = None
+        a_clean = None
         cut_cleaned = None
         bg = None
         result = None
         try:
             im = ImageOps.exif_transpose(Image.open(src)).convert("RGBA")
-            cut = remove(im, session=session)
-            if not isinstance(cut, Image.Image):
-                cut = Image.open(io.BytesIO(cut)).convert("RGBA")
-            else:
-                cut = cut.convert("RGBA")
+            r_ch, g_ch, b_ch, _ = im.split()
 
-            r_ch, g_ch, b_ch, a_ch = cut.split()
+            # 三模型加权融合（或单模型）生成平衡后的 Alpha 通道
+            a_ch = self._fuse_triple_alphas(im, weighted_sessions)
+
             flt = ImageFilter
             if flt is None:
                 from PIL import ImageFilter as _flt
@@ -1470,7 +1565,7 @@ class App:
             r_px = r_ch.load()
             g_px = g_ch.load()
             b_px = b_ch.load()
-            w, h = cut.size
+            w, h = im.size
             blend = 0.28 if fine_edge else 0.18
             for y in range(h):
                 for x in range(w):
@@ -1496,37 +1591,43 @@ class App:
             target.write_bytes(data)
             return out_folder
         finally:
-            for obj in (result, bg, cut_cleaned, cut, im):
+            for obj in (result, bg, cut_cleaned, a_clean, a_ch, im):
                 if obj is not None:
                     try:
                         obj.close()
                     except Exception:
                         pass
 
-    def _worker(self, images, input_paths, base_out, rgb, fmt, max_kb, model_name, fine_edge, workers):
-        session = None
+    def _worker(self, images, input_paths, base_out, rgb, fmt, max_kb, ensemble_enabled, fine_edge, workers):
+        weighted_sessions = []
         try:
             if remove is None or new_session is None:
                 self.msgq.put(("fatal", "缺少 rembg 组件，请检查打包是否完整。"))
                 return
 
-            model_dir = prepare_model_env(model_name)
-            existing_file = _find_existing_model_file(model_name)
-            if existing_file is not None:
-                self.msgq.put(("status", f"已找到本地模型文件：{existing_file.name}，正在加载……"))
-            else:
-                self.msgq.put(("status", f"未在 {model_dir} 找到模型，正在自动下载 [{model_name}]……"))
+            models_root = prepare_all_models_env()
+            target_specs = ENSEMBLE_MODELS if ensemble_enabled else [(PRIMARY_FALLBACK_MODEL, 1.0)]
 
-            try:
-                session = new_session(model_name)
-            except Exception as e:
-                self.msgq.put((
-                    "fatal",
-                    f"AI 模型 [{model_name}] 加载或下载失败：{e}\n固定模型目录：{model_dir}",
-                ))
-                return
+            for idx, (m_name, weight) in enumerate(target_specs, 1):
+                m_dir = get_model_subdir(m_name)
+                existing_file = _find_existing_model_file(m_name)
+                if existing_file is not None:
+                    self.msgq.put(("status", f"正在加载内置模型 ({idx}/{len(target_specs)})：{m_name} ……"))
+                else:
+                    self.msgq.put(("status", f"未在本地找到 {m_name}，正在自动下载 ({idx}/{len(target_specs)})……"))
+                try:
+                    sess = new_session(m_name)
+                    weighted_sessions.append((m_name, weight, sess))
+                except Exception as e:
+                    self.msgq.put((
+                        "fatal",
+                        f"AI 模型 [{m_name}] 加载或下载失败：{e}\n固定模型目录：{m_dir}\n（若处于离线环境，请确认安装包已完整包含 {models_root}）",
+                    ))
+                    return
 
-            self.msgq.put(("status", f"模型已就绪，开始 {workers} 线程并发处理 {len(images)} 张图片……"))
+            self.msgq.put(("refresh_model_status",))
+            engine_tip = "三模型融合引擎" if ensemble_enabled else PRIMARY_FALLBACK_MODEL
+            self.msgq.put(("status", f"{engine_tip} 已就绪，开始 {workers} 线程并发处理 {len(images)} 张图片……"))
 
             ext = ".png" if fmt == "PNG" else ".jpg"
             effective_workers = max(1, min(workers, len(images)))
@@ -1542,7 +1643,7 @@ class App:
                         self._process_single_image,
                         src,
                         input_paths,
-                        session,
+                        weighted_sessions,
                         base_out,
                         rgb,
                         fmt,
@@ -1592,8 +1693,12 @@ class App:
         except Exception:
             self.msgq.put(("fatal", f"后台处理线程发生未捕获异常：\n{traceback.format_exc()}"))
         finally:
-            if session is not None:
-                del session
+            for _, _, sess in weighted_sessions:
+                try:
+                    del sess
+                except Exception:
+                    pass
+            weighted_sessions.clear()
             gc.collect()
 
     def _poll(self):
@@ -1603,17 +1708,20 @@ class App:
                 kind = item[0]
                 if kind == "status":
                     self.status.set(item[1])
+                elif kind == "refresh_model_status":
+                    self._refresh_model_status_label()
                 elif kind == "model_dl_done":
                     _, ok_flag, m_name, info_str = item
                     self._is_downloading_model = False
                     self.download_model_btn.set_enabled(True)
                     self.start_btn.set_enabled(True)
+                    self._refresh_model_status_label()
                     if ok_flag:
-                        self.status.set(f"模型 [{m_name}] 已就绪（存放于 {info_str}）")
-                        messagebox.showinfo("下载完成", f"模型 [{m_name}] 已准备就绪：\n{info_str}")
+                        self.status.set(f"{m_name} 已全部就绪（存放于 {info_str}）")
+                        messagebox.showinfo("下载完成", f"{m_name} 已全部准备就绪，可离线使用：\n{info_str}")
                     else:
-                        self.status.set(f"模型 [{m_name}] 下载失败")
-                        messagebox.showerror("下载失败", f"模型 [{m_name}] 下载出错：\n{info_str}")
+                        self.status.set(f"{m_name} 下载失败")
+                        messagebox.showerror("下载失败", f"{m_name} 下载出错：\n{info_str}")
                 elif kind == "item_done":
                     _, src, state, v, total, msg = item
                     self._mark_image_state(src, state)
@@ -1641,8 +1749,36 @@ class App:
             self.root.after(100, self._poll)
 
 
+def cli_download_all_models() -> int:
+    """
+    供打包阶段（如 GitHub Actions 或本地构建脚本）静默调用：
+    python 证件照批量换底色_2.py --download-all-models
+    将全部 3 个模型下载到 <软件根目录>\_internal\.u2net\models\<模型名>\ 中，方便随安装包一起打包。
+    """
+    try:
+        models_root = prepare_all_models_env()
+        print(f"[INFO] 固定模型根目录: {models_root}")
+        from rembg import new_session as _new_session
+        for idx, m_name in enumerate(ALL_MODEL_NAMES, 1):
+            print(f"[INFO] ({idx}/3) 正在准备模型: {m_name} ...")
+            sess = _new_session(m_name)
+            del sess
+            gc.collect()
+            found = _find_existing_model_file(m_name)
+            print(f"[OK]   模型 {m_name} 已就绪 -> {found}")
+        print("[SUCCESS] 全部 3 个离线模型已下载并归整完成！")
+        return 0
+    except Exception as e:
+        print(f"[ERROR] 模型预下载失败: {e}")
+        traceback.print_exc()
+        return 1
+
+
 def main():
-    global Image, ImageOps, ImageFilter, remove, new_session
+    if "--download-all-models" in sys.argv:
+        sys.exit(cli_download_all_models())
+
+    global Image, ImageOps, ImageFilter, ImageChops, remove, new_session
 
     try:
         if HAS_DND and TkinterDnD is not None:
@@ -1654,14 +1790,19 @@ def main():
         load_q = queue.Queue()
 
         def load_deps():
-            global Image, ImageOps, ImageFilter, remove, new_session
+            global Image, ImageOps, ImageFilter, ImageChops, remove, new_session
             try:
-                prepare_model_env("birefnet-portrait")
+                prepare_all_models_env()
                 load_q.put(("STAGE", 20.0, "正在准备图像解码组件 (Pillow)..."))
-                from PIL import Image as _Image, ImageOps as _ImageOps, ImageFilter as _ImageFilter
-                Image, ImageOps, ImageFilter = _Image, _ImageOps, _ImageFilter
+                from PIL import (
+                    Image as _Image,
+                    ImageOps as _ImageOps,
+                    ImageFilter as _ImageFilter,
+                    ImageChops as _ImageChops,
+                )
+                Image, ImageOps, ImageFilter, ImageChops = _Image, _ImageOps, _ImageFilter, _ImageChops
 
-                load_q.put(("STAGE", 50.0, "正在初始化 AI 抠图引擎 (rembg / onnxruntime)..."))
+                load_q.put(("STAGE", 55.0, "正在初始化三模型 AI 抠图引擎 (rembg / onnxruntime)..."))
                 from rembg import remove as _remove, new_session as _new_session
                 remove, new_session = _remove, _new_session
 

@@ -14,7 +14,7 @@ on:
           - all
 
 env:
-  APP_VERSION: "2.2.0.3"
+  APP_VERSION: "3.0.0.0"
 
 permissions:
   contents: write
@@ -37,11 +37,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller pillow rembg onnxruntime tkinterdnd2
 
-      - name: 4. 预下载默认离线 AI 抠图模型 (birefnet-portrait)
+      - name: 4. 预下载全部三套离线 AI 抠图模型 (birefnet-portrait / isnet-general-use / u2net)
         env:
           U2NET_HOME: ${{ github.workspace }}\build_u2net\.u2net
         run: |
-          python -c "import os; os.makedirs(os.environ['U2NET_HOME'], exist_ok=True); from rembg import new_session; new_session('birefnet-portrait')"
+          python -c "import os, gc; os.makedirs(os.environ['U2NET_HOME'], exist_ok=True); from rembg import new_session; models = ['birefnet-portrait', 'isnet-general-use', 'u2net']; [ (print(f'Downloading {m}...'), globals().__setitem__('_s', new_session(m)), globals().__setitem__('_s', None), gc.collect()) for m in models ]"
 
       - name: 5. 生成与 APP_VERSION 同步的 EXE 版本信息文件
         shell: pwsh
@@ -86,8 +86,10 @@ jobs:
           "@
           Set-Content -Path "version_info.txt" -Value $content -Encoding UTF8
 
-      - name: 6. 使用 PyInstaller 打包免安装文件夹（含版本信息、元数据与默认模型）
+      - name: 6. 使用 PyInstaller 打包免安装文件夹（含版本信息、元数据与三套离线模型）
+        shell: pwsh
         run: |
+          $entryScript = if (Test-Path "证件照批量换底色_2.py") { "证件照批量换底色_2.py" } else { "证件照批量换底色.py" }
           pyinstaller --noconfirm --clean --onedir --windowed `
             --name "证件照批量换底色工具_Czq" `
             --icon "app.ico" `
@@ -97,7 +99,14 @@ jobs:
             --collect-all rembg `
             --add-data "app.ico;." `
             --add-data "build_u2net\.u2net;.u2net" `
-            "证件照批量换底色.py"
+            $entryScript
+
+          $srcModels = "${{ github.workspace }}\build_u2net\.u2net\models"
+          $dstModels = "${{ github.workspace }}\dist\证件照批量换底色工具_Czq\_internal\.u2net\models"
+          if (Test-Path $srcModels) {
+            New-Item -ItemType Directory -Force -Path $dstModels | Out-Null
+            Copy-Item -Path "$srcModels\*" -Destination $dstModels -Recurse -Force
+          }
 
       - name: 7. 同步版本号并编译 Inno Setup 安装程序
         if: ${{ github.event.inputs.build_target == 'installer' || github.event.inputs.build_target == 'all' }}
