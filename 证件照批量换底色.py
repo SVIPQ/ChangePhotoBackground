@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-证件照批量换底色工具_Czq（竖屏紧凑布局 + 大小限制开关 + 同名/已处理胶囊弹窗版）
+证件照批量换底色工具_Czq（竖屏紧凑布局 + 导出下方名称清单实时箭头映射 + 完成绿色大勾 ✔ 版）
 """
 import gc
 import io
 import math
 import os
 import queue
+import re
 import shutil
 import sys
 import threading
@@ -95,7 +96,8 @@ THEME = {
     "drop_border": "#93C5FD",
     "drop_fg": "#1E40AF",
     "list_bg": "#F8FAFC",
-    "ok_green": "#16A34A",
+    "ok_green": "#15803D",
+    "ok_bg": "#DCFCE7",
     "err_red": "#DC2626",
 }
 
@@ -277,6 +279,25 @@ def collect_images(paths):
     return result
 
 
+def parse_name_lines(raw_text: str) -> list[str]:
+    """按行拆分名称清单，清洗非法文件名字符并去掉多余后缀"""
+    if not raw_text:
+        return []
+    lines = []
+    for raw_line in raw_text.splitlines():
+        s = raw_line.strip()
+        if not s:
+            continue
+        # 若用户粘贴了带常见图片后缀的名称，去掉原后缀以便统一按输出格式拼接
+        s_no_ext = re.sub(r"\.(jpg|jpeg|png|bmp|webp|tif|tiff)$", "", s, flags=re.IGNORECASE).strip()
+        if not s_no_ext:
+            s_no_ext = s
+        safe = re.sub(r'[\\/:*?"<>|]+', "_", s_no_ext).strip(" .")
+        if safe:
+            lines.append(safe)
+    return lines
+
+
 def resolve_output_root_for_image(src: Path, input_paths: list, base_export_dir: Path) -> tuple[Path, Path]:
     roots = [Path(p).resolve() for p in input_paths if Path(p).exists() and Path(p).is_dir()]
     src_resolved = src.resolve()
@@ -293,12 +314,19 @@ def resolve_output_root_for_image(src: Path, input_paths: list, base_export_dir:
     return base_export_dir / folder_name, Path(src_resolved.name)
 
 
-def compute_target_output_path(src: Path, input_paths: list, base_out: Path, ext: str) -> tuple[Path, Path]:
+def compute_target_output_path(
+    src: Path,
+    input_paths: list,
+    base_out: Path,
+    ext: str,
+    custom_stem: str | None = None,
+) -> tuple[Path, Path]:
     out_folder, relative = resolve_output_root_for_image(src, input_paths, base_out)
     target_dir = out_folder / relative.parent
-    target = target_dir / (src.stem + ext)
+    stem_to_use = custom_stem if custom_stem else src.stem
+    target = target_dir / (stem_to_use + ext)
     if target.resolve() == src.resolve():
-        target = target_dir / (src.stem + f"_converted{ext}")
+        target = target_dir / (stem_to_use + f"_converted{ext}")
     return out_folder, target
 
 
@@ -306,7 +334,6 @@ def encode_image_output(image, fmt, limit_enabled: bool, max_kb: int):
     fmt_upper = (fmt or "JPG").upper()
     img = image.convert("RGB")
 
-    # 关闭大小限制：原尺寸、最高质量无限制输出
     if not limit_enabled:
         buf = io.BytesIO()
         if fmt_upper == "PNG":
@@ -941,9 +968,8 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_DISPLAY_NAME)
-        # 竖屏比例窗口，砍半横向宽度，上下舒展排布
-        win_w, win_h = 620, 830
-        self.root.minsize(580, 770)
+        win_w, win_h = 630, 910
+        self.root.minsize(590, 840)
         self.root.configure(bg=THEME["bg"])
         center_window_on_screen(self.root, win_w, win_h)
 
@@ -955,10 +981,12 @@ class App:
         self._images = []
         self._img_index_map = {}
         self._img_states = {}
+        self._name_lines = []
         self._is_downloading_model = False
         self._is_running = False
         self._closing = False
         self._poll_job = None
+        self._name_sync_job = None
 
         self.output_dir = tk.StringVar(value=default_output_path)
         self.mode_choice = tk.StringVar(value="single")
@@ -994,6 +1022,12 @@ class App:
             except Exception:
                 pass
             self._poll_job = None
+        if self._name_sync_job is not None:
+            try:
+                self.root.after_cancel(self._name_sync_job)
+            except Exception:
+                pass
+            self._name_sync_job = None
         try:
             self.root.withdraw()
             self.root.quit()
@@ -1038,6 +1072,105 @@ class App:
             parent_bg=THEME["card"],
         )
 
+    def _current_ext(self) -> str:
+        return ".png" if (self.output_format.get() or "JPG").upper() == "PNG" else ".jpg"
+
+    def _preview_target_name(self, idx: int, src: Path) -> str:
+        ext = self._current_ext()
+        if idx < len(self._name_lines):
+            return f"{self._name_lines[idx]}{ext}"
+        if self._name_lines:
+            return f"{src.stem}{ext} [超行沿用原名]"
+        return f"{src.stem}{ext}"
+
+    def _format_list_row(self, idx: int, p: Path, state: str) -> str:
+        mapped_name = self._preview_target_name(idx, p)
+        base_str = f"#{idx + 1}  {p}   -->   {mapped_name}"
+        if state == "ok":
+            return f"{base_str}   ✔"
+        if state == "err":
+            return f"{base_str}   ✗"
+        return base_str
+
+    def _refresh_list_view(self, images):
+        self.listbox.delete(0, tk.END)
+        self._img_index_map = {}
+        for idx, p in enumerate(images):
+            key = str(p.resolve())
+            self._img_index_map[key] = idx
+            state = self._img_states.get(key, "pending")
+            if idx < 2000:
+                self.listbox.insert(tk.END, self._format_list_row(idx, p, state))
+                if state == "ok":
+                    self.listbox.itemconfig(idx, fg=THEME["ok_green"], bg=THEME["ok_bg"])
+                elif state == "err":
+                    self.listbox.itemconfig(idx, fg=THEME["err_red"], bg=THEME["list_bg"])
+                else:
+                    self.listbox.itemconfig(idx, fg=THEME["text"], bg=THEME["list_bg"])
+
+    def _mark_image_state(self, src: Path, state: str):
+        key = str(src.resolve())
+        self._img_states[key] = state
+        idx = self._img_index_map.get(key)
+        if idx is not None and idx < self.listbox.size():
+            self.listbox.delete(idx)
+            self.listbox.insert(idx, self._format_list_row(idx, src, state))
+            if state == "ok":
+                self.listbox.itemconfig(idx, fg=THEME["ok_green"], bg=THEME["ok_bg"])
+            elif state == "err":
+                self.listbox.itemconfig(idx, fg=THEME["err_red"], bg=THEME["list_bg"])
+
+    def _on_name_text_modified(self, _event=None):
+        try:
+            self.name_text.edit_modified(False)
+        except Exception:
+            pass
+        if self._name_sync_job is not None:
+            try:
+                self.root.after_cancel(self._name_sync_job)
+            except Exception:
+                pass
+        self._name_sync_job = self.root.after(120, self._apply_name_lines_preview)
+
+    def _apply_name_lines_preview(self):
+        self._name_sync_job = None
+        raw = self.name_text.get("1.0", "end-1c")
+        self._name_lines = parse_name_lines(raw)
+        name_cnt = len(self._name_lines)
+        img_cnt = len(self._images)
+        if name_cnt == 0:
+            self.name_count_lbl.configure(text="已输入 0 行名称（未填则沿用原名）", fg=THEME["muted"])
+        elif img_cnt > 0 and name_cnt != img_cnt:
+            self.name_count_lbl.configure(
+                text=f"名称 {name_cnt} 行 / 图片 {img_cnt} 张（数量不一致，请核对是否串行）",
+                fg=THEME["err_red"],
+            )
+        else:
+            self.name_count_lbl.configure(
+                text=f"已输入 {name_cnt} 行名称（已按顺序一一对应箭头）",
+                fg=THEME["ok_green"],
+            )
+        if self._images:
+            self._refresh_list_view(self._images)
+
+    def import_names_txt(self):
+        txt_path = filedialog.askopenfilename(
+            title="选择名称清单 TXT 文件",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if txt_path:
+            try:
+                content = Path(txt_path).read_text(encoding="utf-8-sig")
+            except Exception:
+                content = Path(txt_path).read_text(encoding="gbk", errors="ignore")
+            self.name_text.delete("1.0", tk.END)
+            self.name_text.insert("1.0", content)
+            self._apply_name_lines_preview()
+
+    def clear_names_text(self):
+        self.name_text.delete("1.0", tk.END)
+        self._apply_name_lines_preview()
+
     def _parse_dnd_paths(self, raw_data):
         if not raw_data:
             return []
@@ -1077,41 +1210,6 @@ class App:
         for child in widget.winfo_children():
             result.extend(self._collect_all_children(child))
         return result
-
-    def _format_list_row(self, p: Path, state: str) -> str:
-        if state == "ok":
-            return f"{p}   ✓"
-        if state == "err":
-            return f"{p}   ✗"
-        return str(p)
-
-    def _refresh_list_view(self, images):
-        self.listbox.delete(0, tk.END)
-        self._img_index_map = {}
-        for idx, p in enumerate(images):
-            key = str(p.resolve())
-            self._img_index_map[key] = idx
-            state = self._img_states.get(key, "pending")
-            if idx < 2000:
-                self.listbox.insert(tk.END, self._format_list_row(p, state))
-                if state == "ok":
-                    self.listbox.itemconfig(idx, fg=THEME["ok_green"])
-                elif state == "err":
-                    self.listbox.itemconfig(idx, fg=THEME["err_red"])
-                else:
-                    self.listbox.itemconfig(idx, fg=THEME["text"])
-
-    def _mark_image_state(self, src: Path, state: str):
-        key = str(src.resolve())
-        self._img_states[key] = state
-        idx = self._img_index_map.get(key)
-        if idx is not None and idx < self.listbox.size():
-            self.listbox.delete(idx)
-            self.listbox.insert(idx, self._format_list_row(src, state))
-            if state == "ok":
-                self.listbox.itemconfig(idx, fg=THEME["ok_green"])
-            elif state == "err":
-                self.listbox.itemconfig(idx, fg=THEME["err_red"])
 
     def _enable_full_drop_zone(self, root_container, banner):
         if not HAS_DND or DND_FILES is None:
@@ -1172,10 +1270,10 @@ class App:
             str(p.resolve()): old_states.get(str(p.resolve()), "pending")
             for p in images
         }
-        self._refresh_list_view(images)
+        self._apply_name_lines_preview()
         done_cnt = sum(1 for s in self._img_states.values() if s == "ok")
         if done_cnt > 0:
-            self.status.set(f"共 {len(images)} 张图片（其中 {done_cnt} 张已完成 ✓），点击“开始批量处理”")
+            self.status.set(f"共 {len(images)} 张图片（其中 {done_cnt} 张已完成 ✔），点击“开始批量处理”")
         else:
             self.status.set(f"已找到 {len(images)} 张图片，请点击“开始批量处理”")
 
@@ -1191,7 +1289,7 @@ class App:
         ).pack(anchor="w")
         tk.Frame(header, height=4, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
 
-        # 卡片 1：导入区
+        # 卡片 1：导入列表（实时显示原图 --> 目标名称）
         import_outer, import_card = self._make_pill_card(self.root, radius=22)
 
         main_hint = (
@@ -1202,8 +1300,8 @@ class App:
         drop_banner = SoftPillBanner(
             import_card,
             main_text=main_hint,
-            height=38,
-            radius=19,
+            height=36,
+            radius=18,
             bg_color=THEME["drop_bg"],
             hover_color=THEME["drop_hover"],
             border_color=THEME["drop_border"],
@@ -1214,13 +1312,13 @@ class App:
 
         btn_row = tk.Frame(import_card, bg=THEME["card"])
         btn_row.pack(fill="x", pady=(0, 6))
-        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=108, height=28).pack(side="left", padx=(0, 8))
-        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=116, height=28).pack(side="left")
-        self._make_sec_btn(btn_row, "清空", self.clear, width=96, height=28).pack(side="right")
+        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=106, height=28).pack(side="left", padx=(0, 8))
+        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=114, height=28).pack(side="left")
+        self._make_sec_btn(btn_row, "清空", self.clear, width=92, height=28).pack(side="right")
 
         list_pill = SoftPillField(
             import_card,
-            height=96,
+            height=104,
             radius=16,
             bg_color=THEME["list_bg"],
             border_color=THEME["border"],
@@ -1231,7 +1329,7 @@ class App:
         list_pill.canvas.pack(fill="x")
         self.listbox = tk.Listbox(
             list_pill.inner,
-            height=3,
+            height=4,
             bg=THEME["list_bg"],
             fg=THEME["text"],
             selectbackground=THEME["accent"],
@@ -1245,7 +1343,7 @@ class App:
 
         self._enable_full_drop_zone(import_outer, drop_banner)
 
-        # 卡片 2：处理参数与模型设置（竖屏分块排版，右侧按钮统一对齐）
+        # 卡片 2：处理参数与模型设置
         _, set_card = self._make_pill_card(self.root, radius=22)
         tk.Label(
             set_card,
@@ -1255,7 +1353,6 @@ class App:
             font=("Microsoft YaHei UI", 9, "bold"),
         ).pack(anchor="w", pady=(0, 4))
 
-        # 互斥模式行
         r_mode = tk.Frame(set_card, bg=THEME["card"])
         r_mode.pack(fill="x", pady=(0, 4))
         tk.Radiobutton(
@@ -1284,10 +1381,8 @@ class App:
             font=("Microsoft YaHei UI", 9, "bold"),
         ).pack(side="left")
 
-        # 选项一容器
         self.single_container = tk.Frame(set_card, bg=THEME["card"])
 
-        # 模型单选行（左列放 3 个模型单选，右列对齐“下载模型”按钮）
         r_models = tk.Frame(self.single_container, bg=THEME["card"])
         r_models.pack(fill="x", pady=(0, 4))
 
@@ -1328,7 +1423,6 @@ class App:
         )
         self.download_model_btn.pack(side="right", anchor="n")
 
-        # 自定义路径勾选行 + 下一行路径框与“选择 .onnx”（右对齐）
         r_custom_chk = tk.Frame(self.single_container, bg=THEME["card"])
         r_custom_chk.pack(fill="x", pady=(2, 2))
         tk.Checkbutton(
@@ -1377,7 +1471,6 @@ class App:
         )
         self.pick_onnx_btn.pack(side="right")
 
-        # 选项二容器
         self.ensemble_container = tk.Frame(set_card, bg=THEME["card"])
         tk.Label(
             self.ensemble_container,
@@ -1399,9 +1492,8 @@ class App:
         self.mode_anchor = tk.Frame(set_card, bg=THEME["card"])
         self.mode_anchor.pack(fill="x")
 
-        # 精细发丝去白边（上移到自定义路径下方、背景颜色上方）
         r_fine = tk.Frame(set_card, bg=THEME["card"])
-        r_fine.pack(fill="x", pady=(2, 6))
+        r_fine.pack(fill="x", pady=(2, 5))
         tk.Checkbutton(
             r_fine,
             text="精细发丝去白边（清理发丝与浅色衣领杂边，保留浅色外套轮廓）",
@@ -1413,9 +1505,8 @@ class App:
             font=("Microsoft YaHei UI", 9, "bold"),
         ).pack(anchor="w")
 
-        # 背景颜色行（右侧“自定义颜色”与上方“下载模型”“选择 .onnx”垂直对齐）
         r1 = tk.Frame(set_card, bg=THEME["card"])
-        r1.pack(fill="x", pady=(0, 6))
+        r1.pack(fill="x", pady=(0, 5))
         tk.Label(r1, text="背景颜色：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
         self.preset = ttk.Combobox(
             r1,
@@ -1448,7 +1539,6 @@ class App:
             height=28,
         ).pack(side="right")
 
-        # 输出格式 + 大小限制开关 + KB 上限
         r2 = tk.Frame(set_card, bg=THEME["card"])
         r2.pack(fill="x", pady=(0, 4))
         tk.Label(r2, text="输出格式：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
@@ -1461,6 +1551,7 @@ class App:
             font=("Microsoft YaHei UI", 9),
         )
         self.format_combo.pack(side="left", padx=(4, 12))
+        self.format_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_name_lines_preview())
 
         tk.Checkbutton(
             r2,
@@ -1485,14 +1576,13 @@ class App:
         self.max_kb_spin.pack(side="left", padx=(2, 4))
         self.max_kb_unit_lbl = tk.Label(
             r2,
-            text="KB（关闭则原尺寸输出）",
+            text="KB（超出自动压缩）",
             bg=THEME["card"],
             fg=THEME["muted"],
             font=("Microsoft YaHei UI", 8),
         )
         self.max_kb_unit_lbl.pack(side="left")
 
-        # 并发线程单独一行，竖屏更宽松
         r_th = tk.Frame(set_card, bg=THEME["card"])
         r_th.pack(fill="x")
         tk.Label(r_th, text="并发线程：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
@@ -1507,14 +1597,14 @@ class App:
         tk.Label(r_th, text="线程（建议 1）", bg=THEME["card"], fg=THEME["muted"], font=("Microsoft YaHei UI", 8)).pack(side="left")
 
         # 卡片 3：导出位置
-        _, dir_card = self._make_pill_card(self.root, radius=22, outer_pady=(0, 2))
+        _, dir_card = self._make_pill_card(self.root, radius=22, outer_pady=(0, 6))
         tk.Label(
             dir_card,
             text="导出位置（自动生成同名文件夹，如导入 16 则导出为 <所选位置>\\16）",
             bg=THEME["card"],
             fg=THEME["text"],
             font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(anchor="w", pady=(0, 4))
+        ).pack(anchor="w", pady=(0, 3))
 
         r3 = tk.Frame(dir_card, bg=THEME["card"])
         r3.pack(fill="x")
@@ -1543,6 +1633,55 @@ class App:
         self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=78, height=28).pack(side="left", padx=(0, 6))
         self._make_sec_btn(r3, "浏览", self.choose_output, width=78, height=28).pack(side="right")
 
+        # 卡片 4：导出位置下方的“名称清单”输入框（按行对应导入列表箭头映射）
+        _, name_card = self._make_pill_card(self.root, radius=22, outer_pady=(0, 2))
+        name_top = tk.Frame(name_card, bg=THEME["card"])
+        name_top.pack(fill="x", pady=(0, 4))
+        tk.Label(
+            name_top,
+            text="名称清单（每行一个新名称，支持直接粘贴表格一列或导入 TXT）",
+            bg=THEME["card"],
+            fg=THEME["text"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side="left")
+
+        self._make_sec_btn(name_top, "清空", self.clear_names_text, width=68, height=24).pack(side="right")
+        self._make_sec_btn(name_top, "导入 TXT", self.import_names_txt, width=84, height=24).pack(side="right", padx=(0, 6))
+
+        name_pill = SoftPillField(
+            name_card,
+            height=78,
+            radius=16,
+            bg_color="#F8FAFC",
+            border_color="#CBD5E1",
+            parent_bg=THEME["card"],
+            padx=10,
+            pady=4,
+        )
+        name_pill.canvas.pack(fill="x")
+        self.name_text = tk.Text(
+            name_pill.inner,
+            height=3,
+            bg="#F8FAFC",
+            fg=THEME["text"],
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Microsoft YaHei UI", 9),
+            undo=True,
+        )
+        self.name_text.pack(fill="both", expand=True)
+        self.name_text.bind("<<Modified>>", self._on_name_text_modified)
+
+        self.name_count_lbl = tk.Label(
+            name_card,
+            text="已输入 0 行名称（未填则沿用原名）",
+            bg=THEME["card"],
+            fg=THEME["muted"],
+            font=("Microsoft YaHei UI", 8),
+        )
+        self.name_count_lbl.pack(anchor="w", pady=(3, 0))
+
         # 底部进度与主按钮
         bottom = tk.Frame(self.root, bg=THEME["bg"])
         bottom.pack(fill="x", padx=14, pady=(0, 10))
@@ -1569,7 +1708,7 @@ class App:
             bottom,
             text="开始批量处理",
             command=self.start,
-            width=580,
+            width=590,
             height=38,
             radius=19,
             bg_color=THEME["accent"],
@@ -1676,6 +1815,7 @@ class App:
         self._img_index_map = {}
         self._img_states = {}
         self.listbox.delete(0, tk.END)
+        self._apply_name_lines_preview()
         self.status.set("列表已清空")
 
     def choose_output(self):
@@ -1730,11 +1870,6 @@ class App:
         threading.Thread(target=_dl_worker, daemon=True).start()
 
     def _ask_conflict_or_done_policy(self, done_count: int, disk_exist_count: int, overlap_total: int, total_count: int) -> str | None:
-        """
-        收窄的胶囊按钮确认弹窗：
-        检测列表中已打 ✓ 的记录以及目标输出文件夹中已存在的同名文件，
-        返回 "regen"（替换/重新生成）、"skip"（跳过不生成）或 None（取消）。
-        """
         dlg = tk.Toplevel(self.root)
         dlg.title("已存在 / 已处理文件确认")
         dlg.transient(self.root)
@@ -1759,7 +1894,7 @@ class App:
 
         detail_parts = []
         if done_count > 0:
-            detail_parts.append(f"列表已处理(✓) {done_count} 张")
+            detail_parts.append(f"列表已处理(✔) {done_count} 张")
         if disk_exist_count > 0:
             detail_parts.append(f"导出目录已有同名文件 {disk_exist_count} 张")
         detail_str = "，".join(detail_parts)
@@ -1901,18 +2036,24 @@ class App:
             )
             return
 
-        fmt = (self.output_format.get() or "JPG").upper()
-        ext = ".png" if fmt == "PNG" else ".jpg"
+        self._apply_name_lines_preview()
+        name_snapshot = list(self._name_lines)
+        ext = self._current_ext()
         input_paths_snapshot = list(self.input_paths)
 
-        # 同时检测：1) 列表中已打 ✓ 的项；2) 目标导出目录中已存在同名文件的项
+        # 建立每张图的任务元组：(idx, src, custom_stem)
+        task_entries = []
+        for idx, p in enumerate(all_images):
+            c_stem = name_snapshot[idx] if idx < len(name_snapshot) else None
+            task_entries.append((idx, p, c_stem))
+
         done_set = set()
         disk_exist_set = set()
-        for p in all_images:
+        for _idx, p, c_stem in task_entries:
             key = str(p.resolve())
             if self._img_states.get(key) == "ok":
                 done_set.add(key)
-            _, target_file = compute_target_output_path(p, input_paths_snapshot, base_out, ext)
+            _, target_file = compute_target_output_path(p, input_paths_snapshot, base_out, ext, c_stem)
             if target_file.exists():
                 disk_exist_set.add(key)
 
@@ -1927,30 +2068,28 @@ class App:
             if policy is None:
                 return
             if policy == "skip":
-                images_to_run = [p for p in all_images if str(p.resolve()) not in overlap_keys]
-                for p in all_images:
+                tasks_to_run = [t for t in task_entries if str(t[1].resolve()) not in overlap_keys]
+                for _idx, p, _c in task_entries:
                     key = str(p.resolve())
-                    if key in overlap_keys:
-                        self._img_states[key] = "ok"
-                    else:
-                        self._img_states[key] = "pending"
+                    self._img_states[key] = "ok" if key in overlap_keys else "pending"
                 self._refresh_list_view(all_images)
-                if not images_to_run:
+                if not tasks_to_run:
                     self.status.set("所有重复/已完成文件均已跳过")
                     messagebox.showinfo("提示", "所选文件均已存在或已完成，已全部跳过。")
                     return
             else:
-                images_to_run = list(all_images)
-                for p in images_to_run:
+                tasks_to_run = list(task_entries)
+                for _idx, p, _c in tasks_to_run:
                     self._img_states[str(p.resolve())] = "pending"
                 self._refresh_list_view(all_images)
         else:
-            images_to_run = list(all_images)
-            for p in images_to_run:
+            tasks_to_run = list(task_entries)
+            for _idx, p, _c in tasks_to_run:
                 self._img_states[str(p.resolve())] = "pending"
             self._refresh_list_view(all_images)
 
         prepare_models_env()
+        fmt = (self.output_format.get() or "JPG").upper()
         fine_edge = bool(self.fine_edge.get())
         limit_enabled = bool(self.limit_size_enabled.get())
         max_kb_val = int(self.max_kb.get())
@@ -1961,11 +2100,11 @@ class App:
         self.start_btn.set_enabled(False)
         self.download_model_btn.set_enabled(False)
         self.pick_onnx_btn.set_enabled(False)
-        self.progress.configure(maximum=len(images_to_run), value=0)
+        self.progress.configure(maximum=len(tasks_to_run), value=0)
 
         threading.Thread(
             target=self._worker,
-            args=(images_to_run, input_paths_snapshot, base_out, rgb, fmt, limit_enabled, max_kb_val, target_specs, fine_edge, workers),
+            args=(tasks_to_run, input_paths_snapshot, base_out, rgb, fmt, limit_enabled, max_kb_val, target_specs, fine_edge, workers, ext),
             daemon=True,
         ).start()
 
@@ -2111,7 +2250,20 @@ class App:
         cut_cleaned.close()
         return res
 
-    def _process_single_image(self, src: Path, input_paths: list, weighted_sessions, base_out: Path, rgb, fmt, limit_enabled: bool, max_kb: int, fine_edge: bool, ext: str):
+    def _process_single_image(
+        self,
+        src: Path,
+        c_stem: str | None,
+        input_paths: list,
+        weighted_sessions,
+        base_out: Path,
+        rgb,
+        fmt,
+        limit_enabled: bool,
+        max_kb: int,
+        fine_edge: bool,
+        ext: str,
+    ):
         im = None
         a_ch = None
         result = None
@@ -2120,11 +2272,11 @@ class App:
             a_ch = self._fuse_alphas(im, weighted_sessions)
             result = self._clean_fringe_and_composite(im, a_ch, rgb, fine_edge)
 
-            out_folder, target = compute_target_output_path(src, input_paths, base_out, ext)
+            out_folder, target = compute_target_output_path(src, input_paths, base_out, ext, c_stem)
             target.parent.mkdir(parents=True, exist_ok=True)
             data = encode_image_output(result, fmt, limit_enabled, max_kb)
             target.write_bytes(data)
-            return out_folder
+            return out_folder, target.name
         finally:
             for obj in (result, a_ch, im):
                 if obj is not None:
@@ -2133,7 +2285,7 @@ class App:
                     except Exception:
                         pass
 
-    def _worker(self, images, input_paths, base_out, rgb, fmt, limit_enabled, max_kb, target_specs, fine_edge, workers):
+    def _worker(self, tasks_to_run, input_paths, base_out, rgb, fmt, limit_enabled, max_kb, target_specs, fine_edge, workers, ext):
         weighted_sessions = []
         executor = None
         try:
@@ -2161,10 +2313,10 @@ class App:
                 return
 
             engine_tip = "+".join(m[0] for m in target_specs)
-            self.msgq.put(("status", f"[{engine_tip}] 已就绪，开始处理 {len(images)} 张图片……"))
+            total_tasks = len(tasks_to_run)
+            self.msgq.put(("status", f"[{engine_tip}] 已就绪，开始处理 {total_tasks} 张图片……"))
 
-            ext = ".png" if fmt == "PNG" else ".jpg"
-            effective_workers = max(1, min(workers, len(images)))
+            effective_workers = max(1, min(workers, total_tasks))
             ok = 0
             done_count = 0
             errors = []
@@ -2176,6 +2328,7 @@ class App:
                 executor.submit(
                     self._process_single_image,
                     src,
+                    c_stem,
                     input_paths,
                     weighted_sessions,
                     base_out,
@@ -2185,16 +2338,16 @@ class App:
                     max_kb,
                     fine_edge,
                     ext,
-                ): src
-                for src in images
+                ): (idx, src, c_stem)
+                for idx, src, c_stem in tasks_to_run
             }
 
             for fut in as_completed(future_map):
                 if self._closing:
                     break
-                src = future_map[fut]
+                _idx, src, _c_stem = future_map[fut]
                 try:
-                    out_folder = fut.result()
+                    out_folder, out_fname = fut.result()
                     with lock:
                         ok += 1
                         done_count += 1
@@ -2206,8 +2359,8 @@ class App:
                         src,
                         "ok",
                         cur_done,
-                        len(images),
-                        f"处理中 {cur_done}/{len(images)}（成功 {cur_ok}）：{src.name} ✓",
+                        total_tasks,
+                        f"处理中 {cur_done}/{total_tasks}（成功 {cur_ok}）：{src.name} -> {out_fname} ✔",
                     ))
                 except Exception as e:
                     with lock:
@@ -2219,15 +2372,15 @@ class App:
                         src,
                         "err",
                         cur_done,
-                        len(images),
-                        f"处理中 {cur_done}/{len(images)}（失败）：{src.name} ✗",
+                        total_tasks,
+                        f"处理中 {cur_done}/{total_tasks}（失败）：{src.name} ✗",
                     ))
                 if done_count % 3 == 0:
                     gc.collect()
 
             if not self._closing:
                 summary_out = "；".join(sorted(exported_folders)) if exported_folders else str(base_out)
-                self.msgq.put(("done", ok, len(images), errors, summary_out))
+                self.msgq.put(("done", ok, total_tasks, errors, summary_out))
         except Exception:
             if not self._closing:
                 self.msgq.put(("fatal", f"后台处理线程发生未捕获异常：\n{traceback.format_exc()}"))

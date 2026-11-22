@@ -12,9 +12,11 @@ on:
           - installer
           - portable
           - all
+  push:
+    branches: [ main, master ]
 
 env:
-  APP_VERSION: "4.0.0.1"
+  APP_VERSION: "4.0.0.2"
 
 permissions:
   contents: write
@@ -46,7 +48,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$env:U2NET_HOME\models\isnet-general-use" | Out-Null
           New-Item -ItemType Directory -Force -Path "$env:U2NET_HOME\models\u2net" | Out-Null
           python -c "import os, gc; os.makedirs(os.environ['U2NET_HOME'], exist_ok=True); from rembg import new_session; print('Downloading birefnet-portrait...'); s = new_session('birefnet-portrait'); del s; gc.collect()"
-          # 确保模型文件位于 models\birefnet-portrait 子目录下，避免散落在根目录
           Get-ChildItem -Path "$env:U2NET_HOME" -File -Include *.onnx,*.pth,*.pt | ForEach-Object {
             if ($_.Name -like "*birefnet*") {
               Move-Item -Path $_.FullName -Destination "$env:U2NET_HOME\models\birefnet-portrait\$($_.Name)" -Force
@@ -58,7 +59,7 @@ jobs:
         run: |
           $ver = "${{ env.APP_VERSION }}".Trim().TrimStart('v', 'V')
           $parts = @($ver -split '\.' | Where-Object { $_ -match '^\d+$' })
-          while ($parts.Count -lt 4) { $parts += "0" }
+          while ($parts.Count -lt 4) {$parts += "0" }
           $vTuple = "$($parts[0]), $($parts[1]), $($parts[2]), $($parts[3])"
           $verStr = "${{ env.APP_VERSION }}"
 
@@ -66,41 +67,4 @@ jobs:
           VSVersionInfo(
             ffi=FixedFileInfo(
               filevers=($vTuple),
-              prodvers=($vTuple),
-              mask=0x3f,
-              flags=0x0,
-              OS=0x40004,
-              fileType=0x1,
-              subtype=0x0,
-              date=(0, 0)
-            ),
-            kids=[
-              StringFileInfo([
-                StringTable(
-                  u'080404b0',
-                  [
-                    StringStruct(u'CompanyName', u'Czq'),
-                    StringStruct(u'FileDescription', u'证件照批量换底色工具_Czq'),
-                    StringStruct(u'FileVersion', u'$verStr'),
-                    StringStruct(u'InternalName', u'证件照批量换底色工具_Czq'),
-                    StringStruct(u'LegalCopyright', u'Copyright (c) Czq'),
-                    StringStruct(u'OriginalFilename', u'证件照批量换底色工具_Czq.exe'),
-                    StringStruct(u'ProductName', u'证件照批量换底色工具_Czq'),
-                    StringStruct(u'ProductVersion', u'$verStr')
-                  ]
-                )
-              ]),
-              VarFileInfo([VarStruct(u'Translation', [2052, 1200])])
-            ]
-          )
-          "@
-          Set-Content -Path "version_info.txt" -Value $content -Encoding UTF8
-
-      - name: 6. 使用 PyInstaller 打包免安装文件夹（含版本信息、元数据与默认离线模型）
-        shell: pwsh
-        run: |
-          $entryScript = if (Test-Path "证件照批量换底色.py") { "证件照批量换底色.py" } else { "证件照批量换底色.py" }
-          pyinstaller --noconfirm --clean --onedir --windowed `
-            --name "证件照批量换底色工具_Czq" `
-            --icon "app.ico" `
-            --version-
+              prodvers=($vTuple
