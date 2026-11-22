@@ -1,6 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-证件照批量换底色工具_Czq（竖屏紧凑布局 + 导出下方名称清单实时箭头映射 + 完成绿色大勾 ✔ 版）
+证件照批量换底色工具_Czq
+- 修复亮色/白色肩部衣料被抠掉的问题（蒙版闭运算补全 + 收紧去白边阈值）
+- 导入列表支持右键菜单：
+    * 重新生成（子菜单选 3 个单模型之一单独重算）
+    * 更改生成名称（仅改单张输出名，底部名称清单不动）
+    * 另存为...（单独指定单张导出目录）
+    * 复制图片（复制到剪贴板，优先已生成图，否则原图）
+    * 从列表移除
+    * 删除本地文件
+- 导出位置下方名称清单实时箭头映射 + 完成整行变绿与 ✔
 """
 import gc
 import io
@@ -9,6 +18,7 @@ import os
 import queue
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import traceback
@@ -16,7 +26,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tkinter as tk
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 try:
     import numpy as np
@@ -279,20 +289,22 @@ def collect_images(paths):
     return result
 
 
+def sanitize_stem_name(raw_name: str) -> str:
+    s = (raw_name or "").strip()
+    if not s:
+        return ""
+    s_no_ext = re.sub(r"\.(jpg|jpeg|png|bmp|webp|tif|tiff)$", "", s, flags=re.IGNORECASE).strip()
+    if not s_no_ext:
+        s_no_ext = s
+    return re.sub(r'[\\/:*?"<>|]+', "_", s_no_ext).strip(" .")
+
+
 def parse_name_lines(raw_text: str) -> list[str]:
-    """按行拆分名称清单，清洗非法文件名字符并去掉多余后缀"""
     if not raw_text:
         return []
     lines = []
     for raw_line in raw_text.splitlines():
-        s = raw_line.strip()
-        if not s:
-            continue
-        # 若用户粘贴了带常见图片后缀的名称，去掉原后缀以便统一按输出格式拼接
-        s_no_ext = re.sub(r"\.(jpg|jpeg|png|bmp|webp|tif|tiff)$", "", s, flags=re.IGNORECASE).strip()
-        if not s_no_ext:
-            s_no_ext = s
-        safe = re.sub(r'[\\/:*?"<>|]+', "_", s_no_ext).strip(" .")
+        safe = sanitize_stem_name(raw_line)
         if safe:
             lines.append(safe)
     return lines
@@ -320,13 +332,18 @@ def compute_target_output_path(
     base_out: Path,
     ext: str,
     custom_stem: str | None = None,
+    override_dir: Path | None = None,
 ) -> tuple[Path, Path]:
-    out_folder, relative = resolve_output_root_for_image(src, input_paths, base_out)
-    target_dir = out_folder / relative.parent
     stem_to_use = custom_stem if custom_stem else src.stem
-    target = target_dir / (stem_to_use + ext)
+    if override_dir is not None:
+        out_folder = override_dir
+        target = out_folder / (stem_to_use + ext)
+    else:
+        out_folder, relative = resolve_output_root_for_image(src, input_paths, base_out)
+        target_dir = out_folder / relative.parent
+        target = target_dir / (stem_to_use + ext)
     if target.resolve() == src.resolve():
-        target = target_dir / (stem_to_use + f"_converted{ext}")
+        target = target.parent / (stem_to_use + f"_converted{ext}")
     return out_folder, target
 
 
@@ -376,6 +393,31 @@ def encode_image_output(image, fmt, limit_enabled: bool, max_kb: int):
             break
         img = img.resize((max(1, int(w * 0.85)), max(1, int(h * 0.85))), Image.Resampling.LANCZOS)
     raise ValueError(f"JPG 在可接受的最低尺寸下仍无法压缩到 {max_kb}KB")
+
+
+def copy_image_to_clipboard(img_path: Path):
+    """将图片文件或位图写入 Windows 剪贴板"""
+    resolved = str(img_path.resolve()).replace("'", "''")
+    ps_cmd = (
+        f"$p = '{resolved}'; "
+        f"Add-Type -AssemblyName System.Windows.Forms; "
+        f"Add-Type -AssemblyName System.Drawing; "
+        f"$img = [System.Drawing.Image]::FromFile($p); "
+        f"$bmp = New-Object System.Drawing.Bitmap($img); "
+        f"$img.Dispose(); "
+        f"[System.Windows.Forms.Clipboard]::SetImage($bmp); "
+        f"$files = New-Object System.Collections.Specialized.StringCollection; "
+        f"[void]$files.Add($p); "
+        f"[System.Windows.Forms.Clipboard]::SetFileDropList($files); "
+        f"$bmp.Dispose()"
+    )
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    subprocess.run(
+        ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+        check=True,
+        startupinfo=startupinfo,
+    )
 
 
 def _rounded_rect_points(x1, y1, x2, y2, r, segments=16):
@@ -981,6 +1023,9 @@ class App:
         self._images = []
         self._img_index_map = {}
         self._img_states = {}
+        self._custom_stems = {}       # key -> 单独指定的输出文件名（不含后缀），不动底部名称清单
+        self._custom_out_dirs = {}     # key -> 单独指定的另存为目录 Path
+        self._last_output_files = {}   # key -> 最近一次生成的输出文件路径 Path
         self._name_lines = []
         self._is_downloading_model = False
         self._is_running = False
@@ -1075,13 +1120,27 @@ class App:
     def _current_ext(self) -> str:
         return ".png" if (self.output_format.get() or "JPG").upper() == "PNG" else ".jpg"
 
+    def _effective_stem(self, idx: int, src: Path) -> str:
+        key = str(src.resolve())
+        if key in self._custom_stems and self._custom_stems[key]:
+            return self._custom_stems[key]
+        if idx < len(self._name_lines):
+            return self._name_lines[idx]
+        return src.stem
+
     def _preview_target_name(self, idx: int, src: Path) -> str:
         ext = self._current_ext()
-        if idx < len(self._name_lines):
-            return f"{self._name_lines[idx]}{ext}"
-        if self._name_lines:
-            return f"{src.stem}{ext} [超行沿用原名]"
-        return f"{src.stem}{ext}"
+        key = str(src.resolve())
+        stem = self._effective_stem(idx, src)
+        tag_parts = []
+        if key in self._custom_stems and self._custom_stems[key]:
+            tag_parts.append("单独改名")
+        elif self._name_lines and idx >= len(self._name_lines):
+            tag_parts.append("超行沿用原名")
+        if key in self._custom_out_dirs and self._custom_out_dirs[key]:
+            tag_parts.append(f"另存:{self._custom_out_dirs[key].name or self._custom_out_dirs[key]}")
+        suffix_tag = f" [{' | '.join(tag_parts)}]" if tag_parts else ""
+        return f"{stem}{ext}{suffix_tag}"
 
     def _format_list_row(self, idx: int, p: Path, state: str) -> str:
         mapped_name = self._preview_target_name(idx, p)
@@ -1171,6 +1230,235 @@ class App:
         self.name_text.delete("1.0", tk.END)
         self._apply_name_lines_preview()
 
+    # ---------- 列表右键菜单及单项操作 ----------
+    def _on_listbox_right_click(self, event):
+        if self._is_running or self._is_downloading_model:
+            return
+        idx = self.listbox.nearest(event.y)
+        if idx < 0 or idx >= len(self._images):
+            return
+        self.listbox.selection_clear(0, tk.END)
+        self.listbox.selection_set(idx)
+        self.listbox.activate(idx)
+
+        src = self._images[idx]
+        key = str(src.resolve())
+
+        menu = tk.Menu(self.root, tearoff=0)
+        regen_submenu = tk.Menu(menu, tearoff=0)
+        for m_name in ALL_MODEL_NAMES:
+            ready = is_model_ready(m_name)
+            label = f"{m_name}（已就绪）" if ready else f"{m_name}（需先下载）"
+            regen_submenu.add_command(
+                label=label,
+                command=lambda target_m=m_name, item_idx=idx: self._regen_single_with_model(item_idx, target_m),
+            )
+        menu.add_cascade(label="重新生成", menu=regen_submenu)
+
+        menu.add_command(label="更改生成名称", command=lambda item_idx=idx: self._rename_single_output(item_idx))
+        if key in self._custom_stems:
+            menu.add_command(label="恢复清单/原名", command=lambda item_idx=idx: self._clear_single_custom_name(item_idx))
+
+        menu.add_command(label="另存为...", command=lambda item_idx=idx: self._save_as_single_dir(item_idx))
+        if key in self._custom_out_dirs:
+            menu.add_command(label="取消单独另存位置", command=lambda item_idx=idx: self._clear_single_out_dir(item_idx))
+
+        menu.add_command(label="复制图片", command=lambda item_idx=idx: self._copy_single_image(item_idx))
+        menu.add_separator()
+        menu.add_command(label="从列表移除", command=lambda item_idx=idx: self._remove_from_list(item_idx))
+        menu.add_command(label="删除本地文件", command=lambda item_idx=idx: self._delete_local_file(item_idx))
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _rename_single_output(self, idx: int):
+        if idx < 0 or idx >= len(self._images):
+            return
+        src = self._images[idx]
+        key = str(src.resolve())
+        current_stem = self._effective_stem(idx, src)
+        new_raw = simpledialog.askstring(
+            "更改生成名称",
+            f"原图：{src.name}\n请输入单独生成的名称（底部名称清单不会改动）：",
+            initialvalue=current_stem,
+            parent=self.root,
+        )
+        if new_raw is None:
+            return
+        cleaned = sanitize_stem_name(new_raw)
+        if not cleaned:
+            messagebox.showwarning("提示", "名称不能为空或仅含非法字符。")
+            return
+        self._custom_stems[key] = cleaned
+        self._refresh_list_view(self._images)
+        self.status.set(f"已为 #{idx + 1} {src.name} 单独设置输出名称：{cleaned}{self._current_ext()}")
+
+    def _clear_single_custom_name(self, idx: int):
+        if idx < 0 or idx >= len(self._images):
+            return
+        src = self._images[idx]
+        key = str(src.resolve())
+        self._custom_stems.pop(key, None)
+        self._refresh_list_view(self._images)
+        self.status.set(f"已恢复 #{idx + 1} {src.name} 的默认/清单命名规则")
+
+    def _save_as_single_dir(self, idx: int):
+        if idx < 0 or idx >= len(self._images):
+            return
+        src = self._images[idx]
+        key = str(src.resolve())
+        chosen = filedialog.askdirectory(
+            title=f"选择“{src.name}”的另存为文件夹",
+            parent=self.root,
+        )
+        if chosen:
+            self._custom_out_dirs[key] = Path(chosen)
+            self._refresh_list_view(self._images)
+            self.status.set(f"已设置 #{idx + 1} {src.name} 另存为：{chosen}")
+
+    def _clear_single_out_dir(self, idx: int):
+        if idx < 0 or idx >= len(self._images):
+            return
+        src = self._images[idx]
+        key = str(src.resolve())
+        self._custom_out_dirs.pop(key, None)
+        self._refresh_list_view(self._images)
+        self.status.set(f"已取消 #{idx + 1} {src.name} 的单独另存位置")
+
+    def _copy_single_image(self, idx: int):
+        if idx < 0 or idx >= len(self._images):
+            return
+        src = self._images[idx]
+        key = str(src.resolve())
+        out_p = self._last_output_files.get(key)
+        target_to_copy = out_p if (out_p is not None and out_p.exists()) else src
+        try:
+            copy_image_to_clipboard(target_to_copy)
+            kind_label = "已生成图片" if target_to_copy == out_p else "原图"
+            self.status.set(f"已复制{kind_label}到剪贴板：{target_to_copy.name}")
+        except Exception as e:
+            messagebox.showerror("复制失败", f"无法复制到剪贴板：\n{e}")
+
+    def _remove_from_list(self, idx: int):
+        if idx < 0 or idx >= len(self._images):
+            return
+        removed = self._images.pop(idx)
+        key = str(removed.resolve())
+        self._img_states.pop(key, None)
+        self._custom_stems.pop(key, None)
+        self._custom_out_dirs.pop(key, None)
+        self._last_output_files.pop(key, None)
+        self._apply_name_lines_preview()
+        self.status.set(f"已从列表移除：{removed.name}")
+
+    def _delete_local_file(self, idx: int):
+        if idx < 0 or idx >= len(self._images):
+            return
+        src = self._images[idx]
+        key = str(src.resolve())
+        out_p = self._last_output_files.get(key)
+        lines = [f"原文件：{src}"]
+        if out_p is not None and out_p.exists():
+            lines.append(f"已生成文件：{out_p}")
+        confirm = messagebox.askyesno(
+            "删除本地文件",
+            "确定要从硬盘删除以下本地文件吗？删除后无法恢复！\n\n" + "\n".join(lines),
+            parent=self.root,
+        )
+        if not confirm:
+            return
+        try:
+            if out_p is not None and out_p.exists():
+                out_p.unlink()
+            if src.exists():
+                src.unlink()
+            self._remove_from_list(idx)
+            self.status.set(f"已删除本地文件：{src.name}")
+        except Exception as e:
+            messagebox.showerror("删除失败", f"删除文件时出错：\n{e}")
+
+    def _regen_single_with_model(self, idx: int, model_name: str):
+        if self._is_running or self._is_downloading_model:
+            return
+        if idx < 0 or idx >= len(self._images):
+            return
+        if not is_model_ready(model_name):
+            messagebox.showwarning(
+                "模型未就绪",
+                f"模型 [{model_name}] 尚未下载。\n请先在上方“选项一：选择单个模型”中选择该模型并点击“下载模型”。",
+            )
+            return
+
+        src = self._images[idx]
+        key = str(src.resolve())
+        c_stem = self._custom_stems.get(key) or (self._name_lines[idx] if idx < len(self._name_lines) else None)
+        out_dir_override = self._custom_out_dirs.get(key)
+
+        out_str = self.output_dir.get().strip()
+        if not out_str and out_dir_override is None:
+            messagebox.showwarning("提示", "请先设置导出位置。")
+            return
+        base_out = Path(out_str or str(Path.home() / "Desktop")).expanduser()
+        if out_dir_override is None:
+            base_out.mkdir(parents=True, exist_ok=True)
+        else:
+            out_dir_override.mkdir(parents=True, exist_ok=True)
+
+        try:
+            rgb = hex_to_rgb(self.color.get())
+        except Exception as e:
+            messagebox.showerror("颜色设置错误", str(e))
+            return
+
+        ext = self._current_ext()
+        fmt = (self.output_format.get() or "JPG").upper()
+        fine_edge = bool(self.fine_edge.get())
+        limit_enabled = bool(self.limit_size_enabled.get())
+        max_kb_val = int(self.max_kb.get())
+        input_paths_snapshot = list(self.input_paths)
+
+        self._is_running = True
+        self.start_btn.set_enabled(False)
+        self.status.set(f"正在使用 [{model_name}] 重新生成 #{idx + 1} {src.name} ……")
+
+        def _single_worker():
+            sess = None
+            try:
+                prepare_models_env()
+                sess = new_session(model_name)
+                out_folder, out_fname = self._process_single_image(
+                    src=src,
+                    c_stem=c_stem,
+                    input_paths=input_paths_snapshot,
+                    weighted_sessions=[(model_name, 1.0, sess)],
+                    base_out=base_out,
+                    rgb=rgb,
+                    fmt=fmt,
+                    limit_enabled=limit_enabled,
+                    max_kb=max_kb_val,
+                    fine_edge=fine_edge,
+                    ext=ext,
+                    override_dir=out_dir_override,
+                )
+                self._last_output_files[key] = out_folder / out_fname
+                if not self._closing:
+                    self.msgq.put(("single_regen_done", True, src, f"[{model_name}] 重新生成完成：{out_fname} ✔"))
+            except Exception as e:
+                if not self._closing:
+                    self.msgq.put(("single_regen_done", False, src, f"重新生成失败：{src.name} -> {e}"))
+            finally:
+                if sess is not None:
+                    try:
+                        del sess
+                    except Exception:
+                        pass
+                gc.collect()
+
+        threading.Thread(target=_single_worker, daemon=True).start()
+
+    # ---------- 拖入与列表管理 ----------
     def _parse_dnd_paths(self, raw_data):
         if not raw_data:
             return []
@@ -1289,13 +1577,13 @@ class App:
         ).pack(anchor="w")
         tk.Frame(header, height=4, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
 
-        # 卡片 1：导入列表（实时显示原图 --> 目标名称）
+        # 卡片 1：导入列表
         import_outer, import_card = self._make_pill_card(self.root, radius=22)
 
         main_hint = (
-            "将整个文件夹或图片拖入此处，确认后手动点击开始"
+            "将文件夹或图片拖入此处；列表项支持右键重新生成/改名/另存/复制"
             if HAS_DND
-            else "点击下方“添加照片”或“添加文件夹”选择待处理图片"
+            else "点击下方添加图片；列表项支持右键重新生成/改名/另存/复制"
         )
         drop_banner = SoftPillBanner(
             import_card,
@@ -1340,6 +1628,7 @@ class App:
             font=("Microsoft YaHei UI", 9),
         )
         self.listbox.pack(fill="both", expand=True)
+        self.listbox.bind("<Button-3>", self._on_listbox_right_click)
 
         self._enable_full_drop_zone(import_outer, drop_banner)
 
@@ -1496,7 +1785,7 @@ class App:
         r_fine.pack(fill="x", pady=(2, 5))
         tk.Checkbutton(
             r_fine,
-            text="精细发丝去白边（清理发丝与浅色衣领杂边，保留浅色外套轮廓）",
+            text="精细发丝去白边（清理细碎杂边，保留浅色/白色衣料与肩部轮廓）",
             variable=self.fine_edge,
             bg=THEME["card"],
             fg=THEME["text"],
@@ -1633,7 +1922,7 @@ class App:
         self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=78, height=28).pack(side="left", padx=(0, 6))
         self._make_sec_btn(r3, "浏览", self.choose_output, width=78, height=28).pack(side="right")
 
-        # 卡片 4：导出位置下方的“名称清单”输入框（按行对应导入列表箭头映射）
+        # 卡片 4：导出位置下方的“名称清单”输入框
         _, name_card = self._make_pill_card(self.root, radius=22, outer_pady=(0, 2))
         name_top = tk.Frame(name_card, bg=THEME["card"])
         name_top.pack(fill="x", pady=(0, 4))
@@ -1814,6 +2103,9 @@ class App:
         self._images = []
         self._img_index_map = {}
         self._img_states = {}
+        self._custom_stems = {}
+        self._custom_out_dirs = {}
+        self._last_output_files = {}
         self.listbox.delete(0, tk.END)
         self._apply_name_lines_preview()
         self.status.set("列表已清空")
@@ -2041,19 +2333,28 @@ class App:
         ext = self._current_ext()
         input_paths_snapshot = list(self.input_paths)
 
-        # 建立每张图的任务元组：(idx, src, custom_stem)
+        # 建立每张图的任务元组：(idx, src, custom_stem, out_dir_override)
         task_entries = []
         for idx, p in enumerate(all_images):
-            c_stem = name_snapshot[idx] if idx < len(name_snapshot) else None
-            task_entries.append((idx, p, c_stem))
+            key = str(p.resolve())
+            if key in self._custom_stems and self._custom_stems[key]:
+                c_stem = self._custom_stems[key]
+            elif idx < len(name_snapshot):
+                c_stem = name_snapshot[idx]
+            else:
+                c_stem = None
+            out_override = self._custom_out_dirs.get(key)
+            if out_override is not None:
+                out_override.mkdir(parents=True, exist_ok=True)
+            task_entries.append((idx, p, c_stem, out_override))
 
         done_set = set()
         disk_exist_set = set()
-        for _idx, p, c_stem in task_entries:
+        for _idx, p, c_stem, out_override in task_entries:
             key = str(p.resolve())
             if self._img_states.get(key) == "ok":
                 done_set.add(key)
-            _, target_file = compute_target_output_path(p, input_paths_snapshot, base_out, ext, c_stem)
+            _, target_file = compute_target_output_path(p, input_paths_snapshot, base_out, ext, c_stem, out_override)
             if target_file.exists():
                 disk_exist_set.add(key)
 
@@ -2069,7 +2370,7 @@ class App:
                 return
             if policy == "skip":
                 tasks_to_run = [t for t in task_entries if str(t[1].resolve()) not in overlap_keys]
-                for _idx, p, _c in task_entries:
+                for _idx, p, _c, _o in task_entries:
                     key = str(p.resolve())
                     self._img_states[key] = "ok" if key in overlap_keys else "pending"
                 self._refresh_list_view(all_images)
@@ -2079,12 +2380,12 @@ class App:
                     return
             else:
                 tasks_to_run = list(task_entries)
-                for _idx, p, _c in tasks_to_run:
+                for _idx, p, _c, _o in tasks_to_run:
                     self._img_states[str(p.resolve())] = "pending"
                 self._refresh_list_view(all_images)
         else:
             tasks_to_run = list(task_entries)
-            for _idx, p, _c in tasks_to_run:
+            for _idx, p, _c, _o in tasks_to_run:
                 self._img_states[str(p.resolve())] = "pending"
             self._refresh_list_view(all_images)
 
@@ -2119,9 +2420,34 @@ class App:
             cut_img.close()
         return alpha
 
+    def _stabilize_alpha(self, alpha_img):
+        """
+        适度形态学闭运算（先膨胀再腐蚀），补全白色/亮色肩部衣料等容易被误判为背景的区域
+        """
+        flt = ImageFilter
+        if flt is None:
+            from PIL import ImageFilter as _flt
+            flt = _flt
+        dilated = alpha_img.filter(flt.MaxFilter(size=5))
+        closed = dilated.filter(flt.MinFilter(size=5))
+        if HAS_NUMPY:
+            a_arr = np.asarray(alpha_img, dtype=np.float32)
+            c_arr = np.asarray(closed, dtype=np.float32)
+            # 保留原始精细发丝与半透明过渡，仅在闭运算明显大于原 alpha 的区域适度补全
+            boosted = np.maximum(a_arr, 0.72 * c_arr + 0.28 * a_arr)
+            res = Image.fromarray(np.clip(boosted, 0, 255).astype(np.uint8), mode="L")
+        else:
+            res = closed
+        try:
+            dilated.close()
+        except Exception:
+            pass
+        return res
+
     def _fuse_alphas(self, im_rgba, weighted_sessions):
         if len(weighted_sessions) == 1:
-            return self._run_model_alpha(im_rgba, weighted_sessions[0][2])
+            raw_a = self._run_model_alpha(im_rgba, weighted_sessions[0][2])
+            return self._stabilize_alpha(raw_a)
 
         chops = ImageChops
         if chops is None:
@@ -2142,7 +2468,7 @@ class App:
             portrait_alpha = support_alphas.pop(0)
 
         if not support_alphas:
-            return portrait_alpha
+            return self._stabilize_alpha(portrait_alpha)
 
         support_max = support_alphas[0]
         for other in support_alphas[1:]:
@@ -2187,9 +2513,13 @@ class App:
             support_soft.close()
         except Exception:
             pass
-        return fused
+        return self._stabilize_alpha(fused)
 
     def _clean_fringe_and_composite(self, im_rgba, alpha_img, rgb, fine_edge):
+        """
+        收紧去白边范围：仅对低 alpha（真正半透明边缘，如 < 170）且极亮（luma > 205）的像素做适度融合，
+        避免把白色/浅色衣料和肩部色块洗成背景色。
+        """
         if HAS_NUMPY:
             rgba_arr = np.asarray(im_rgba, dtype=np.float32)
             a_arr = np.asarray(alpha_img, dtype=np.float32)
@@ -2197,25 +2527,17 @@ class App:
             g = rgba_arr[:, :, 1]
             b = rgba_arr[:, :, 2]
 
-            edge_mask = (a_arr > 0.0) & (a_arr < 240.0)
+            edge_mask = (a_arr > 0.0) & (a_arr < 170.0)
             if np.any(edge_mask):
                 luma = 0.299 * r + 0.587 * g + 0.114 * b
-                edge_ratio = np.clip((240.0 - a_arr) / 240.0, 0.0, 1.0)
-                bright_mask = edge_mask & (luma > 165.0)
+                edge_ratio = np.clip((170.0 - a_arr) / 170.0, 0.0, 1.0)
+                bright_mask = edge_mask & (luma > 205.0)
                 if np.any(bright_mask):
-                    base_str = 0.45 if fine_edge else 0.28
-                    strength = np.minimum(0.85, base_str + 0.40 * edge_ratio)
+                    base_str = 0.25 if fine_edge else 0.15
+                    strength = np.minimum(0.55, base_str + 0.25 * edge_ratio)
                     r = np.where(bright_mask, r * (1.0 - strength) + rgb[0] * strength, r)
                     g = np.where(bright_mask, g * (1.0 - strength) + rgb[1] * strength, g)
                     b = np.where(bright_mask, b * (1.0 - strength) + rgb[2] * strength, b)
-
-                if fine_edge:
-                    soft_mask = edge_mask & (~bright_mask) & (a_arr < 120.0)
-                    if np.any(soft_mask):
-                        strength2 = np.minimum(0.45, 0.22 + 0.22 * edge_ratio)
-                        r = np.where(soft_mask, r * (1.0 - strength2) + rgb[0] * strength2, r)
-                        g = np.where(soft_mask, g * (1.0 - strength2) + rgb[1] * strength2, g)
-                        b = np.where(soft_mask, b * (1.0 - strength2) + rgb[2] * strength2, b)
 
             alpha_norm = a_arr / 255.0
             out_r = r * alpha_norm + rgb[0] * (1.0 - alpha_norm)
@@ -2233,12 +2555,12 @@ class App:
         for y in range(h):
             for x in range(w):
                 alpha_val = a_px[x, y]
-                if 0 < alpha_val < 240:
+                if 0 < alpha_val < 170:
                     rv, gv, bv = r_px[x, y], g_px[x, y], b_px[x, y]
                     luma = 0.299 * rv + 0.587 * gv + 0.114 * bv
-                    edge_ratio = (240.0 - alpha_val) / 240.0
-                    if luma > 165.0:
-                        strength = min(0.85, (0.45 if fine_edge else 0.28) + 0.40 * edge_ratio)
+                    edge_ratio = (170.0 - alpha_val) / 170.0
+                    if luma > 205.0:
+                        strength = min(0.55, (0.25 if fine_edge else 0.15) + 0.25 * edge_ratio)
                         r_px[x, y] = int(rv * (1.0 - strength) + rgb[0] * strength)
                         g_px[x, y] = int(gv * (1.0 - strength) + rgb[1] * strength)
                         b_px[x, y] = int(bv * (1.0 - strength) + rgb[2] * strength)
@@ -2263,6 +2585,7 @@ class App:
         max_kb: int,
         fine_edge: bool,
         ext: str,
+        override_dir: Path | None = None,
     ):
         im = None
         a_ch = None
@@ -2272,10 +2595,13 @@ class App:
             a_ch = self._fuse_alphas(im, weighted_sessions)
             result = self._clean_fringe_and_composite(im, a_ch, rgb, fine_edge)
 
-            out_folder, target = compute_target_output_path(src, input_paths, base_out, ext, c_stem)
+            out_folder, target = compute_target_output_path(
+                src, input_paths, base_out, ext, c_stem, override_dir=override_dir
+            )
             target.parent.mkdir(parents=True, exist_ok=True)
             data = encode_image_output(result, fmt, limit_enabled, max_kb)
             target.write_bytes(data)
+            self._last_output_files[str(src.resolve())] = target
             return out_folder, target.name
         finally:
             for obj in (result, a_ch, im):
@@ -2338,8 +2664,9 @@ class App:
                     max_kb,
                     fine_edge,
                     ext,
+                    out_override,
                 ): (idx, src, c_stem)
-                for idx, src, c_stem in tasks_to_run
+                for idx, src, c_stem, out_override in tasks_to_run
             }
 
             for fut in as_completed(future_map):
@@ -2423,6 +2750,15 @@ class App:
                     self._mark_image_state(src, state)
                     self.progress.configure(value=v)
                     self.status.set(msg)
+                elif kind == "single_regen_done":
+                    _, ok_flag, src, msg = item
+                    self._is_running = False
+                    self.start_btn.set_enabled(True)
+                    self._sync_mode_panels()
+                    self._mark_image_state(src, "ok" if ok_flag else "err")
+                    self.status.set(msg)
+                    if not ok_flag:
+                        messagebox.showerror("重新生成失败", msg)
                 elif kind == "fatal":
                     self._is_running = False
                     self.start_btn.set_enabled(True)

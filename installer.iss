@@ -1,6 +1,6 @@
 ; 证件照批量换底色工具_Czq Inno Setup 安装脚本（默认 birefnet-portrait + 彻底卸载模型版）
 #define MyAppName "证件照批量换底色工具_Czq"
-#define MyAppVersion "4.2.0.0"
+#define MyAppVersion "4.3.0.0"
 #define MyAppPublisher "Czq"
 #define MyAppExeName "证件照批量换底色工具_Czq.exe"
 #define MyDesktopShortcutName "证件照批量换底色工具"
