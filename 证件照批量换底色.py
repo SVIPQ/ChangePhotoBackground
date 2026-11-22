@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 证件照批量换底色工具_Czq
-- 修复亮色/白色肩部衣料被抠掉的问题（蒙版闭运算补全 + 收紧去白边阈值）
+- 单模型 BiRefNet 抠图后增加边缘背景估计与人体区域保护，降低浅色衣物/肩膀误删
+- 可选 OpenCV GrabCut 对疑似误删区域进行局部修复；未安装 OpenCV 时自动使用保守模式
+- 底部增加单张实时进度条、总进度条、数字百分比、单张步骤说明、批量总体进度与当前照片名称
 - 导入列表支持右键菜单：
     * 重新生成（子菜单选 3 个单模型之一单独重算）
     * 更改生成名称（仅改单张输出名，底部名称清单不动）
@@ -34,6 +36,13 @@ try:
 except Exception:
     np = None
     HAS_NUMPY = False
+
+try:
+    import cv2
+    HAS_OPENCV = True
+except Exception:
+    cv2 = None
+    HAS_OPENCV = False
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -110,6 +119,16 @@ THEME = {
     "ok_bg": "#DCFCE7",
     "err_red": "#DC2626",
 }
+
+
+def format_model_label(model_name: str) -> str:
+    if model_name == "birefnet-portrait":
+        return "BiRefNet"
+    if model_name == "isnet-general-use":
+        return "ISNet"
+    if model_name == "u2net":
+        return "U2Net"
+    return model_name
 
 
 def get_app_root_dir() -> Path:
@@ -1010,8 +1029,8 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_DISPLAY_NAME)
-        win_w, win_h = 630, 910
-        self.root.minsize(590, 840)
+        win_w, win_h = 630, 955
+        self.root.minsize(590, 885)
         self.root.configure(bg=THEME["bg"])
         center_window_on_screen(self.root, win_w, win_h)
 
@@ -1047,6 +1066,9 @@ class App:
         self.max_kb = tk.IntVar(value=50)
         self.thread_count = tk.IntVar(value=default_threads)
         self.status = tk.StringVar(value="拖入文件夹确认后，再点击下方“开始批量处理”")
+        self.overall_status = tk.StringVar(value="总体进度：0%（已完成 0/0 张） | 当前照片：无")
+        self.pct_text = tk.StringVar(value="0%")
+        self.overall_pct_text = tk.StringVar(value="0%")
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -1230,6 +1252,36 @@ class App:
         self.name_text.delete("1.0", tk.END)
         self._apply_name_lines_preview()
 
+    def _calc_overall_pct(self, finished_count: int, total_count: int, active_pct: float = 0.0) -> float:
+        if total_count <= 0:
+            return 0.0
+        if finished_count >= total_count:
+            return 100.0
+        val = ((finished_count + max(0.0, min(100.0, active_pct)) / 100.0) / total_count) * 100.0
+        return max(0.0, min(99.0, val))
+
+    def _update_progress_display(
+        self,
+        pct: float,
+        step_text: str,
+        overall_text: str | None = None,
+        overall_pct: float | None = None,
+    ):
+        clamped = max(0.0, min(100.0, float(pct)))
+        self.progress.configure(maximum=100.0, value=clamped)
+        self.pct_text.set(f"{int(round(clamped))}%")
+        self.status.set(step_text)
+        if overall_text is not None:
+            self.overall_status.set(overall_text)
+        if overall_pct is not None:
+            o_clamped = max(0.0, min(100.0, float(overall_pct)))
+            self.overall_progress.configure(maximum=100.0, value=o_clamped)
+            self.overall_pct_text.set(f"{int(round(o_clamped))}%")
+
+    def _format_overall_progress(self, finished_count: int, total_count: int, current_photo: str, active_pct: float = 0.0) -> str:
+        overall_pct = int(round(self._calc_overall_pct(finished_count, total_count, active_pct)))
+        return f"总体进度：{overall_pct}%（已完成 {finished_count}/{total_count} 张） | 当前照片：{current_photo}"
+
     # ---------- 列表右键菜单及单项操作 ----------
     def _on_listbox_right_click(self, event):
         if self._is_running or self._is_downloading_model:
@@ -1387,7 +1439,7 @@ class App:
         if not is_model_ready(model_name):
             messagebox.showwarning(
                 "模型未就绪",
-                f"模型 [{model_name}] 尚未下载。\n请先在上方“选项一：选择单个模型”中选择该模型并点击“下载模型”。",
+                f"模型 [{model_name}] 尚未下载。\n请先在上方“抠图模型”中选择该模型并点击“下载模型”。",
             )
             return
 
@@ -1418,15 +1470,28 @@ class App:
         limit_enabled = bool(self.limit_size_enabled.get())
         max_kb_val = int(self.max_kb.get())
         input_paths_snapshot = list(self.input_paths)
+        model_label = format_model_label(model_name)
 
         self._is_running = True
         self.start_btn.set_enabled(False)
-        self.status.set(f"正在使用 [{model_name}] 重新生成 #{idx + 1} {src.name} ……")
+        self._update_progress_display(
+            10.0,
+            f"正在加载 {model_label} 模型（10%）",
+            f"总体进度：0%（已完成 0/1 张） | 当前照片：{src.name}",
+            overall_pct=0.0,
+        )
 
         def _single_worker():
             sess = None
             try:
                 prepare_models_env()
+                self.msgq.put((
+                    "step_progress",
+                    10.0,
+                    f"正在加载 {model_label} 模型（10%）",
+                    f"总体进度：10%（已完成 0/1 张） | 当前照片：{src.name}",
+                    10.0,
+                ))
                 sess = new_session(model_name)
                 out_folder, out_fname = self._process_single_image(
                     src=src,
@@ -1441,10 +1506,17 @@ class App:
                     fine_edge=fine_edge,
                     ext=ext,
                     override_dir=out_dir_override,
+                    step_cb=lambda pct, desc: self.msgq.put((
+                        "step_progress",
+                        pct,
+                        desc,
+                        f"总体进度：{int(round(pct))}%（已完成 0/1 张） | 当前照片：{src.name}",
+                        pct,
+                    )),
                 )
                 self._last_output_files[key] = out_folder / out_fname
                 if not self._closing:
-                    self.msgq.put(("single_regen_done", True, src, f"[{model_name}] 重新生成完成：{out_fname} ✔"))
+                    self.msgq.put(("single_regen_done", True, src, f"当前照片处理完成（100%） - {out_fname} ✔"))
             except Exception as e:
                 if not self._closing:
                     self.msgq.put(("single_regen_done", False, src, f"重新生成失败：{src.name} -> {e}"))
@@ -1564,6 +1636,13 @@ class App:
             self.status.set(f"共 {len(images)} 张图片（其中 {done_cnt} 张已完成 ✔），点击“开始批量处理”")
         else:
             self.status.set(f"已找到 {len(images)} 张图片，请点击“开始批量处理”")
+        init_overall_pct = (done_cnt / len(images) * 100.0) if images else 0.0
+        self._update_progress_display(
+            0.0,
+            self.status.get(),
+            f"总体进度：{int(round(init_overall_pct))}%（已完成 {done_cnt}/{len(images)} 张） | 当前照片：无",
+            overall_pct=init_overall_pct,
+        )
 
     def _build(self):
         header = tk.Frame(self.root, bg=THEME["bg"])
@@ -1646,7 +1725,7 @@ class App:
         r_mode.pack(fill="x", pady=(0, 4))
         tk.Radiobutton(
             r_mode,
-            text="选项一：选择单个模型",
+            text="抠图模型（建议使用 BiRefNet Portrait）",
             variable=self.mode_choice,
             value="single",
             command=self._sync_mode_panels,
@@ -1656,19 +1735,6 @@ class App:
             activebackground=THEME["card"],
             font=("Microsoft YaHei UI", 9, "bold"),
         ).pack(side="left", padx=(0, 18))
-
-        tk.Radiobutton(
-            r_mode,
-            text="选项二：模型叠加引擎",
-            variable=self.mode_choice,
-            value="ensemble",
-            command=self._sync_mode_panels,
-            bg=THEME["card"],
-            fg=THEME["text"],
-            selectcolor="#EFF6FF",
-            activebackground=THEME["card"],
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(side="left")
 
         self.single_container = tk.Frame(set_card, bg=THEME["card"])
 
@@ -1785,7 +1851,7 @@ class App:
         r_fine.pack(fill="x", pady=(2, 5))
         tk.Checkbutton(
             r_fine,
-            text="精细发丝去白边（清理细碎杂边，保留浅色/白色衣料与肩部轮廓）",
+            text="精细边缘保护（保留发丝与浅色衣物边缘，建议开启）",
             variable=self.fine_edge,
             bg=THEME["card"],
             fg=THEME["text"],
@@ -1971,27 +2037,83 @@ class App:
         )
         self.name_count_lbl.pack(anchor="w", pady=(3, 0))
 
-        # 底部进度与主按钮
+        # 底部：单张进度条、总进度条、百分比、步骤说明、总体进度与当前照片名称
         bottom = tk.Frame(self.root, bg=THEME["bg"])
         bottom.pack(fill="x", padx=14, pady=(0, 10))
 
-        tk.Frame(bottom, height=8, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
+        tk.Frame(bottom, height=5, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
 
+        prog_row = tk.Frame(bottom, bg=THEME["bg"])
+        prog_row.pack(fill="x", pady=(0, 3))
+        tk.Label(
+            prog_row,
+            text="当前：",
+            bg=THEME["bg"],
+            fg=THEME["muted"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(side="left", padx=(0, 4))
         self.progress = SoftPillProgressBar(
-            bottom,
-            height=12,
+            prog_row,
+            height=10,
             track_color="#DCEAFF",
             fill_color=THEME["accent"],
             parent_bg=THEME["bg"],
         )
-        self.progress.pack(fill="x", pady=(0, 4))
+        self.progress.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        tk.Label(
+            prog_row,
+            textvariable=self.pct_text,
+            bg=THEME["bg"],
+            fg=THEME["accent"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+            width=5,
+            anchor="e",
+        ).pack(side="right")
+
+        overall_prog_row = tk.Frame(bottom, bg=THEME["bg"])
+        overall_prog_row.pack(fill="x", pady=(0, 3))
+        tk.Label(
+            overall_prog_row,
+            text="总计：",
+            bg=THEME["bg"],
+            fg=THEME["muted"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(side="left", padx=(0, 4))
+        self.overall_progress = SoftPillProgressBar(
+            overall_prog_row,
+            height=12,
+            track_color="#DBEAFE",
+            fill_color="#1D4ED8",
+            parent_bg=THEME["bg"],
+        )
+        self.overall_progress.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        tk.Label(
+            overall_prog_row,
+            textvariable=self.overall_pct_text,
+            bg=THEME["bg"],
+            fg="#1D4ED8",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            width=5,
+            anchor="e",
+        ).pack(side="right")
+
         tk.Label(
             bottom,
             textvariable=self.status,
             bg=THEME["bg"],
+            fg=THEME["text"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 1))
+
+        tk.Label(
+            bottom,
+            textvariable=self.overall_status,
+            bg=THEME["bg"],
             fg=THEME["muted"],
-            font=("Microsoft YaHei UI", 9),
-        ).pack(anchor="w", pady=(0, 6))
+            font=("Microsoft YaHei UI", 8),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 5))
 
         self.start_btn = SoftPillButton(
             bottom,
@@ -2108,7 +2230,12 @@ class App:
         self._last_output_files = {}
         self.listbox.delete(0, tk.END)
         self._apply_name_lines_preview()
-        self.status.set("列表已清空")
+        self._update_progress_display(
+            0.0,
+            "列表已清空",
+            "总体进度：0%（已完成 0/0 张） | 当前照片：无",
+            overall_pct=0.0,
+        )
 
     def choose_output(self):
         p = filedialog.askdirectory(title="选择导出位置（将在此位置下生成同名文件夹）")
@@ -2324,7 +2451,7 @@ class App:
             messagebox.showwarning(
                 "模型尚未就绪",
                 f"当前任务需要模型：{', '.join(missing_models)}\n\n"
-                f"请先在“选项一：选择单个模型”中下载该模型，或勾选“自定义路径”选择对应的 .onnx 文件。",
+                f"请先在“抠图模型”中下载该模型，或勾选“自定义路径”选择对应的 .onnx 文件。",
             )
             return
 
@@ -2375,7 +2502,12 @@ class App:
                     self._img_states[key] = "ok" if key in overlap_keys else "pending"
                 self._refresh_list_view(all_images)
                 if not tasks_to_run:
-                    self.status.set("所有重复/已完成文件均已跳过")
+                    self._update_progress_display(
+                        100.0,
+                        "所有重复/已完成文件均已跳过",
+                        f"总体进度：100%（已完成 {len(all_images)}/{len(all_images)} 张） | 当前照片：无",
+                        overall_pct=100.0,
+                    )
                     messagebox.showinfo("提示", "所选文件均已存在或已完成，已全部跳过。")
                     return
             else:
@@ -2396,12 +2528,18 @@ class App:
         max_kb_val = int(self.max_kb.get())
 
         self._is_running = True
-        mode_desc = "+".join(m[0] for m in target_specs)
-        self.status.set(f"正在加载模型 [{mode_desc}] ……")
+        first_model_label = format_model_label(target_specs[0][0])
+        first_photo_name = tasks_to_run[0][1].name if tasks_to_run else "无"
         self.start_btn.set_enabled(False)
         self.download_model_btn.set_enabled(False)
         self.pick_onnx_btn.set_enabled(False)
-        self.progress.configure(maximum=len(tasks_to_run), value=0)
+        init_o_pct = self._calc_overall_pct(0, len(tasks_to_run), 10.0)
+        self._update_progress_display(
+            10.0,
+            f"正在加载 {first_model_label} 模型（10%）",
+            self._format_overall_progress(0, len(tasks_to_run), first_photo_name, 10.0),
+            overall_pct=init_o_pct,
+        )
 
         threading.Thread(
             target=self._worker,
@@ -2421,156 +2559,164 @@ class App:
         return alpha
 
     def _stabilize_alpha(self, alpha_img):
-        """
-        适度形态学闭运算（先膨胀再腐蚀），补全白色/亮色肩部衣料等容易被误判为背景的区域
-        """
+        """轻度修补蒙版中的小孔洞，不再用过小闭运算假装修复大块衣物缺失。"""
         flt = ImageFilter
         if flt is None:
             from PIL import ImageFilter as _flt
             flt = _flt
-        dilated = alpha_img.filter(flt.MaxFilter(size=5))
-        closed = dilated.filter(flt.MinFilter(size=5))
+        # 仅做很轻的局部平滑，避免把头发和衣服边缘过度膨胀。
+        soft = alpha_img.filter(flt.MaxFilter(size=3)).filter(flt.MinFilter(size=3))
         if HAS_NUMPY:
-            a_arr = np.asarray(alpha_img, dtype=np.float32)
-            c_arr = np.asarray(closed, dtype=np.float32)
-            # 保留原始精细发丝与半透明过渡，仅在闭运算明显大于原 alpha 的区域适度补全
-            boosted = np.maximum(a_arr, 0.72 * c_arr + 0.28 * a_arr)
-            res = Image.fromarray(np.clip(boosted, 0, 255).astype(np.uint8), mode="L")
-        else:
-            res = closed
+            a = np.asarray(alpha_img, dtype=np.float32)
+            b = np.asarray(soft, dtype=np.float32)
+            out = np.maximum(a, 0.35 * b + 0.65 * a)
+            res = Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="L")
+            soft.close()
+            return res
+        return soft
+
+    def _estimate_border_color(self, rgb_arr):
+        """从四周窄边估计原始背景颜色，适用于常见纯色证件照背景。"""
+        h, w = rgb_arr.shape[:2]
+        t = max(2, min(12, int(round(min(h, w) * 0.012))))
+        border = np.concatenate((
+            rgb_arr[:t, :, :].reshape(-1, 3),
+            rgb_arr[-t:, :, :].reshape(-1, 3),
+            rgb_arr[:, :t, :].reshape(-1, 3),
+            rgb_arr[:, -t:, :].reshape(-1, 3),
+        ), axis=0)
+        # 中位数比均值更不容易被头发/肩膀碰到画面边缘的少量像素污染。
+        return np.median(border, axis=0).astype(np.float32)
+
+    def _refine_alpha_single_model(self, im_rgba, alpha_img):
+        """
+        单模型专用蒙版修复：
+        1) 估计照片四周的原背景颜色；
+        2) 只在 AI 人像框附近寻找“颜色明显不像背景、但 alpha 被压低”的像素；
+        3) 有 OpenCV 时用 GrabCut 在局部区域做前景/背景判别；
+        4) 修复只作用于疑似漏抠区，不整体膨胀人物轮廓。
+
+        这是针对纯色证件照背景的保守补救，不会把整张照片的白色区域一概当成人物。
+        """
+        if not HAS_NUMPY:
+            return self._stabilize_alpha(alpha_img)
+
+        rgba = np.asarray(im_rgba, dtype=np.uint8)
+        rgb = rgba[:, :, :3]
+        original = np.asarray(alpha_img, dtype=np.uint8)
+        h, w = original.shape
+        if min(h, w) < 64:
+            return self._stabilize_alpha(alpha_img)
+
+        # 人像蒙版边界框，外扩以覆盖被误删的肩部边缘。
+        ys, xs = np.where(original > 24)
+        if len(xs) < 100:
+            return self._stabilize_alpha(alpha_img)
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        padx = max(8, int(w * 0.10))
+        pady = max(8, int(h * 0.035))
+        x0, x1 = max(0, x0 - padx), min(w, x1 + padx)
+        y0, y1 = max(0, y0 - pady), min(h, y1 + pady)
+
+        bg_rgb = self._estimate_border_color(rgb)
+        # RGB 距离对典型蓝/红/白纯色底足够稳定；阈值采用保守值。
+        color_dist = np.sqrt(np.sum((rgb.astype(np.float32) - bg_rgb[None, None, :]) ** 2, axis=2))
+        roi_alpha = original[y0:y1, x0:x1]
+        roi_dist = color_dist[y0:y1, x0:x1]
+        roi_rgb = rgb[y0:y1, x0:x1]
+
+        # 背景色差异较大的低 alpha 像素是优先恢复对象，白色衣服对蓝底通常有很大色差。
+        # 不对 alpha 已经很高的区域动刀，也不扩张到人像框之外。
+        candidate = (roi_alpha < 105) & (roi_dist > 34.0)
+        if int(candidate.sum()) < max(24, int(candidate.size * 0.00008)):
+            return self._stabilize_alpha(alpha_img)
+
+        if HAS_OPENCV:
+            try:
+                # GrabCut 在 ROI 中以 AI 蒙版作先验，以边缘背景色作背景种子。
+                # 先构造四分类蒙版：确定背景/确定前景/可能背景/可能前景。
+                gc_mask = np.full(roi_alpha.shape, cv2.GC_PR_BGD, dtype=np.uint8)
+                gc_mask[roi_alpha >= 225] = cv2.GC_FGD
+                gc_mask[(roi_alpha >= 65) & (roi_alpha < 225)] = cv2.GC_PR_FGD
+                # 仅将“与边缘背景相近”的区域设为可能背景；疑似白衣漏抠区域保持可能前景。
+                gc_mask[(roi_dist < 23.0) & (roi_alpha < 65)] = cv2.GC_PR_BGD
+                gc_mask[candidate] = cv2.GC_PR_FGD
+
+                # ROI 四周仍与原图边缘相接、且颜色接近背景的像素作为确定背景种子。
+                bg_like = (roi_dist < 18.0).astype(np.uint8)
+                n, labels = cv2.connectedComponents(bg_like, connectivity=8)
+                edge_labels = np.concatenate((
+                    labels[0, :][bg_like[0, :] > 0],
+                    labels[-1, :][bg_like[-1, :] > 0],
+                    labels[:, 0][bg_like[:, 0] > 0],
+                    labels[:, -1][bg_like[:, -1] > 0],
+                ))
+                border_labels = set(np.unique(edge_labels).tolist()) if edge_labels.size else set()
+                border_labels.discard(0)
+                if border_labels:
+                    connected_bg = np.isin(labels, list(border_labels)) & (roi_alpha < 80)
+                    gc_mask[connected_bg] = cv2.GC_BGD
+
+                # 保护 AI 高置信度前景，避免 GrabCut 把深色头发/衣服重新判成背景。
+                gc_mask[roi_alpha >= 245] = cv2.GC_FGD
+                bgr = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2BGR)
+                bgd_model = np.zeros((1, 65), np.float64)
+                fgd_model = np.zeros((1, 65), np.float64)
+                cv2.grabCut(bgr, gc_mask, None, bgd_model, fgd_model, 2, cv2.GC_INIT_WITH_MASK)
+                gc_fg = (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD)
+                # 只接受位于颜色差异候选区的恢复结果，避免整体轮廓变胖。
+                recovered = gc_fg & candidate
+                if recovered.any():
+                    # 让新恢复的衣料区域保留柔和边缘，内部达到较高不透明度。
+                    rec = cv2.GaussianBlur(recovered.astype(np.float32), (0, 0), sigmaX=0.85)
+                    rec_alpha = np.clip(rec * 235.0, 0, 235).astype(np.uint8)
+                    roi_alpha = np.maximum(roi_alpha, rec_alpha)
+                    refined = original.copy()
+                    refined[y0:y1, x0:x1] = roi_alpha
+                    # 最后只做半径很小的边缘平滑。
+                    out = Image.fromarray(refined, mode="L").filter(ImageFilter.GaussianBlur(radius=0.35))
+                    return out
+            except Exception:
+                # GrabCut 失败时继续走下面的保守备用策略。
+                pass
+
+        # 无 OpenCV/GrabCut 失败时，不进行激进的颜色补全，避免把背景误判成人体。
+        return self._stabilize_alpha(alpha_img)
+
+    def _fuse_alphas(self, im_rgba, weighted_sessions, fine_edge=True, step_cb=None):
+        # 当前用户采用单模型模式时，严格只运行所选模型，不再叠加其他模型。
+        if callable(step_cb):
+            step_cb(30.0, "正在进行 AI 人像识别（30%）")
+        raw_a = self._run_model_alpha(im_rgba, weighted_sessions[0][2])
+        if callable(step_cb):
+            step_cb(70.0, "正在优化头发、肩膀和衣服边缘（70%）")
         try:
-            dilated.close()
-        except Exception:
-            pass
-        return res
-
-    def _fuse_alphas(self, im_rgba, weighted_sessions):
-        if len(weighted_sessions) == 1:
-            raw_a = self._run_model_alpha(im_rgba, weighted_sessions[0][2])
-            return self._stabilize_alpha(raw_a)
-
-        chops = ImageChops
-        if chops is None:
-            from PIL import ImageChops as _chops
-            chops = _chops
-
-        portrait_alpha = None
-        support_alphas = []
-
-        for m_name, _weight, sess in weighted_sessions:
-            a = self._run_model_alpha(im_rgba, sess)
-            if m_name == DEFAULT_MODEL and portrait_alpha is None:
-                portrait_alpha = a
-            else:
-                support_alphas.append(a)
-
-        if portrait_alpha is None and support_alphas:
-            portrait_alpha = support_alphas.pop(0)
-
-        if not support_alphas:
-            return self._stabilize_alpha(portrait_alpha)
-
-        support_max = support_alphas[0]
-        for other in support_alphas[1:]:
-            next_max = chops.lighter(support_max, other)
-            if support_max is not support_alphas[0]:
-                support_max.close()
-            other.close()
-            support_max = next_max
-
-        flt = ImageFilter
-        if flt is None:
-            from PIL import ImageFilter as _flt
-            flt = _flt
-        support_soft = support_max.filter(flt.GaussianBlur(radius=1.0))
-        if support_max is not support_alphas[0]:
-            support_max.close()
-
-        if HAS_NUMPY:
-            p_arr = np.asarray(portrait_alpha, dtype=np.float32)
-            s_arr = np.asarray(support_soft, dtype=np.float32)
-            weighted = 0.78 * p_arr + 0.22 * s_arr
-            fused_arr = np.clip(np.maximum(weighted, s_arr), 0, 255).astype(np.uint8)
-            fused = Image.fromarray(fused_arr, mode="L")
-        else:
-            w, h = im_rgba.size
-            fused = Image.new("L", (w, h), 0)
-            p_px = portrait_alpha.load()
-            s_px = support_soft.load()
-            f_px = fused.load()
-            for y in range(h):
-                for x in range(w):
-                    pv = p_px[x, y]
-                    sv = s_px[x, y]
-                    val = max(sv, int(0.78 * pv + 0.22 * sv + 0.5))
-                    f_px[x, y] = 255 if val > 255 else (0 if val < 0 else val)
-
-        try:
-            portrait_alpha.close()
-        except Exception:
-            pass
-        try:
-            support_soft.close()
-        except Exception:
-            pass
-        return self._stabilize_alpha(fused)
+            refined = self._refine_alpha_single_model(im_rgba, raw_a) if fine_edge else self._stabilize_alpha(raw_a)
+        finally:
+            try:
+                raw_a.close()
+            except Exception:
+                pass
+        return refined
 
     def _clean_fringe_and_composite(self, im_rgba, alpha_img, rgb, fine_edge):
-        """
-        收紧去白边范围：仅对低 alpha（真正半透明边缘，如 < 170）且极亮（luma > 205）的像素做适度融合，
-        避免把白色/浅色衣料和肩部色块洗成背景色。
-        """
+        """按真实 alpha 合成；不再把所有高亮边缘强行染成新底色，避免白衣/肩部被洗色。"""
         if HAS_NUMPY:
-            rgba_arr = np.asarray(im_rgba, dtype=np.float32)
-            a_arr = np.asarray(alpha_img, dtype=np.float32)
-            r = rgba_arr[:, :, 0]
-            g = rgba_arr[:, :, 1]
-            b = rgba_arr[:, :, 2]
+            src = np.asarray(im_rgba, dtype=np.float32)[:, :, :3]
+            a = np.asarray(alpha_img, dtype=np.float32) / 255.0
+            bg = np.asarray(rgb, dtype=np.float32).reshape(1, 1, 3)
+            out = src * a[:, :, None] + bg * (1.0 - a[:, :, None])
+            return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="RGB")
 
-            edge_mask = (a_arr > 0.0) & (a_arr < 170.0)
-            if np.any(edge_mask):
-                luma = 0.299 * r + 0.587 * g + 0.114 * b
-                edge_ratio = np.clip((170.0 - a_arr) / 170.0, 0.0, 1.0)
-                bright_mask = edge_mask & (luma > 205.0)
-                if np.any(bright_mask):
-                    base_str = 0.25 if fine_edge else 0.15
-                    strength = np.minimum(0.55, base_str + 0.25 * edge_ratio)
-                    r = np.where(bright_mask, r * (1.0 - strength) + rgb[0] * strength, r)
-                    g = np.where(bright_mask, g * (1.0 - strength) + rgb[1] * strength, g)
-                    b = np.where(bright_mask, b * (1.0 - strength) + rgb[2] * strength, b)
-
-            alpha_norm = a_arr / 255.0
-            out_r = r * alpha_norm + rgb[0] * (1.0 - alpha_norm)
-            out_g = g * alpha_norm + rgb[1] * (1.0 - alpha_norm)
-            out_b = b * alpha_norm + rgb[2] * (1.0 - alpha_norm)
-            out_arr = np.stack([out_r, out_g, out_b], axis=-1)
-            return Image.fromarray(np.clip(out_arr, 0, 255).astype(np.uint8), mode="RGB")
-
-        r_ch, g_ch, b_ch, _ = im_rgba.split()
-        a_px = alpha_img.load()
-        r_px = r_ch.load()
-        g_px = g_ch.load()
-        b_px = b_ch.load()
-        w, h = im_rgba.size
-        for y in range(h):
-            for x in range(w):
-                alpha_val = a_px[x, y]
-                if 0 < alpha_val < 170:
-                    rv, gv, bv = r_px[x, y], g_px[x, y], b_px[x, y]
-                    luma = 0.299 * rv + 0.587 * gv + 0.114 * bv
-                    edge_ratio = (170.0 - alpha_val) / 170.0
-                    if luma > 205.0:
-                        strength = min(0.55, (0.25 if fine_edge else 0.15) + 0.25 * edge_ratio)
-                        r_px[x, y] = int(rv * (1.0 - strength) + rgb[0] * strength)
-                        g_px[x, y] = int(gv * (1.0 - strength) + rgb[1] * strength)
-                        b_px[x, y] = int(bv * (1.0 - strength) + rgb[2] * strength)
-        cut_cleaned = Image.merge("RGBA", (r_ch, g_ch, b_ch, alpha_img))
-        bg = Image.new("RGBA", cut_cleaned.size, (*rgb, 255))
-        bg.alpha_composite(cut_cleaned)
-        res = bg.convert("RGB")
+        cut = im_rgba.copy()
+        cut.putalpha(alpha_img)
+        bg = Image.new("RGBA", cut.size, (*rgb, 255))
+        bg.alpha_composite(cut)
+        result = bg.convert("RGB")
         bg.close()
-        cut_cleaned.close()
-        return res
+        cut.close()
+        return result
 
     def _process_single_image(
         self,
@@ -2586,15 +2732,24 @@ class App:
         fine_edge: bool,
         ext: str,
         override_dir: Path | None = None,
+        step_cb=None,
     ):
         im = None
         a_ch = None
         result = None
         try:
+            if callable(step_cb):
+                step_cb(15.0, "正在读取照片（15%）")
             im = ImageOps.exif_transpose(Image.open(src)).convert("RGBA")
-            a_ch = self._fuse_alphas(im, weighted_sessions)
+
+            a_ch = self._fuse_alphas(im, weighted_sessions, fine_edge, step_cb=step_cb)
+
+            if callable(step_cb):
+                step_cb(85.0, "正在合成新背景（85%）")
             result = self._clean_fringe_and_composite(im, a_ch, rgb, fine_edge)
 
+            if callable(step_cb):
+                step_cb(95.0, "正在保存图片（95%）")
             out_folder, target = compute_target_output_path(
                 src, input_paths, base_out, ext, c_stem, override_dir=override_dir
             )
@@ -2602,6 +2757,9 @@ class App:
             data = encode_image_output(result, fmt, limit_enabled, max_kb)
             target.write_bytes(data)
             self._last_output_files[str(src.resolve())] = target
+
+            if callable(step_cb):
+                step_cb(100.0, "当前照片处理完成（100%）")
             return out_folder, target.name
         finally:
             for obj in (result, a_ch, im):
@@ -2614,6 +2772,8 @@ class App:
     def _worker(self, tasks_to_run, input_paths, base_out, rgb, fmt, limit_enabled, max_kb, target_specs, fine_edge, workers, ext):
         weighted_sessions = []
         executor = None
+        total_tasks = len(tasks_to_run)
+        first_photo_name = tasks_to_run[0][1].name if tasks_to_run else "无"
         try:
             if remove is None or new_session is None:
                 self.msgq.put(("fatal", "缺少 rembg 组件，请检查打包是否完整。"))
@@ -2624,7 +2784,15 @@ class App:
             for idx, (m_name, weight, custom_p) in enumerate(target_specs, 1):
                 if self._closing:
                     return
-                self.msgq.put(("status", f"正在加载模型 ({idx}/{len(target_specs)})：{m_name} ……"))
+                m_label = format_model_label(m_name)
+                o_pct = self._calc_overall_pct(0, total_tasks, 10.0)
+                self.msgq.put((
+                    "step_progress",
+                    10.0,
+                    f"正在加载 {m_label} 模型（10%）",
+                    self._format_overall_progress(0, total_tasks, first_photo_name, 10.0),
+                    o_pct,
+                ))
                 try:
                     sess = self._build_session_for_spec(m_name, custom_p)
                     weighted_sessions.append((m_name, weight, sess))
@@ -2638,9 +2806,14 @@ class App:
             if self._closing:
                 return
 
-            engine_tip = "+".join(m[0] for m in target_specs)
-            total_tasks = len(tasks_to_run)
-            self.msgq.put(("status", f"[{engine_tip}] 已就绪，开始处理 {total_tasks} 张图片……"))
+            o_pct_read = self._calc_overall_pct(0, total_tasks, 15.0)
+            self.msgq.put((
+                "step_progress",
+                15.0,
+                "正在读取照片（15%）",
+                self._format_overall_progress(0, total_tasks, first_photo_name, 15.0),
+                o_pct_read,
+            ))
 
             effective_workers = max(1, min(workers, total_tasks))
             ok = 0
@@ -2650,6 +2823,21 @@ class App:
             lock = threading.Lock()
 
             executor = ThreadPoolExecutor(max_workers=effective_workers)
+
+            def _make_step_cb(photo_name: str):
+                def _on_step(pct: float, desc: str):
+                    with lock:
+                        cur_done = done_count
+                    cur_o_pct = self._calc_overall_pct(cur_done, total_tasks, pct)
+                    self.msgq.put((
+                        "step_progress",
+                        pct,
+                        desc,
+                        self._format_overall_progress(cur_done, total_tasks, photo_name, pct),
+                        cur_o_pct,
+                    ))
+                return _on_step
+
             future_map = {
                 executor.submit(
                     self._process_single_image,
@@ -2665,6 +2853,7 @@ class App:
                     fine_edge,
                     ext,
                     out_override,
+                    _make_step_cb(src.name),
                 ): (idx, src, c_stem)
                 for idx, src, c_stem, out_override in tasks_to_run
             }
@@ -2678,29 +2867,34 @@ class App:
                     with lock:
                         ok += 1
                         done_count += 1
-                        cur_ok = ok
                         cur_done = done_count
                         exported_folders.add(str(out_folder))
+                    cur_o_pct = self._calc_overall_pct(cur_done, total_tasks, 0.0)
                     self.msgq.put((
                         "item_done",
                         src,
                         "ok",
                         cur_done,
                         total_tasks,
-                        f"处理中 {cur_done}/{total_tasks}（成功 {cur_ok}）：{src.name} -> {out_fname} ✔",
+                        "当前照片处理完成（100%）",
+                        self._format_overall_progress(cur_done, total_tasks, src.name, 0.0),
+                        cur_o_pct,
                     ))
                 except Exception as e:
                     with lock:
                         errors.append(f"{src}: {e}")
                         done_count += 1
                         cur_done = done_count
+                    cur_o_pct = self._calc_overall_pct(cur_done, total_tasks, 0.0)
                     self.msgq.put((
                         "item_done",
                         src,
                         "err",
                         cur_done,
                         total_tasks,
-                        f"处理中 {cur_done}/{total_tasks}（失败）：{src.name} ✗",
+                        f"处理失败：{src.name}",
+                        self._format_overall_progress(cur_done, total_tasks, src.name, 0.0),
+                        cur_o_pct,
                     ))
                 if done_count % 3 == 0:
                     gc.collect()
@@ -2734,6 +2928,9 @@ class App:
                 kind = item[0]
                 if kind == "status":
                     self.status.set(item[1])
+                elif kind == "step_progress":
+                    _, pct, desc, overall_str, o_pct = item
+                    self._update_progress_display(pct, desc, overall_str, overall_pct=o_pct)
                 elif kind == "model_dl_done":
                     _, ok_flag, m_name, info_str = item
                     self._is_downloading_model = False
@@ -2746,17 +2943,22 @@ class App:
                         self.status.set(f"模型 [{m_name}] 下载失败")
                         messagebox.showerror("下载失败", f"模型 [{m_name}] 下载出错：\n{info_str}")
                 elif kind == "item_done":
-                    _, src, state, v, total, msg = item
+                    _, src, state, v, total, msg, overall_str, o_pct = item
                     self._mark_image_state(src, state)
-                    self.progress.configure(value=v)
-                    self.status.set(msg)
+                    self._update_progress_display(100.0 if state == "ok" else 0.0, msg, overall_str, overall_pct=o_pct)
                 elif kind == "single_regen_done":
                     _, ok_flag, src, msg = item
                     self._is_running = False
                     self.start_btn.set_enabled(True)
                     self._sync_mode_panels()
                     self._mark_image_state(src, "ok" if ok_flag else "err")
-                    self.status.set(msg)
+                    done_v = 100.0 if ok_flag else 0.0
+                    self._update_progress_display(
+                        done_v,
+                        msg,
+                        self._format_overall_progress(1 if ok_flag else 0, 1, src.name, done_v),
+                        overall_pct=done_v,
+                    )
                     if not ok_flag:
                         messagebox.showerror("重新生成失败", msg)
                 elif kind == "fatal":
@@ -2770,7 +2972,12 @@ class App:
                     self._is_running = False
                     self.start_btn.set_enabled(True)
                     self._sync_mode_panels()
-                    self.status.set(f"完成：成功 {ok} 张，失败 {len(errors)} 张")
+                    self._update_progress_display(
+                        100.0,
+                        "当前照片处理完成（100%）",
+                        f"总体进度：100%（已完成 {ok}/{total} 张） | 当前照片：全部完成",
+                        overall_pct=100.0,
+                    )
                     msg = f"处理完成！\n成功：{ok}/{total} 张\n导出文件夹：{out_summary}"
                     if errors:
                         msg += "\n\n部分失败原因（最多显示 5 条）：\n" + "\n".join(errors[:5])
