@@ -1,21 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-证件照批量换底色工具_Czq
-功能：
-1. 批量导入图片/文件夹（递归扫描子文件夹），支持顶部区域鼠标拖放文件夹/图片并确认；
-2. 固定以当前程序所在根目录为基准，统一从 <软件根目录>\_internal\.u2net\models\<模型名> 读取与下载模型；
-3. 低占用智能抠图引擎：默认 birefnet-portrait（发丝细节）+ isnet-general-use（防漏抠兜底），可选叠加 u2net，兼顾干净边缘与低内存/低占用；
-4. 点右上角关闭按钮可彻底退出进程，不再残留后台假死进程；
-5. 窗口宽度拉宽至 920，完整容纳胶囊框与按钮文字，避免截断。
+证件照批量换底色工具_Czq（竖屏紧凑布局 + 大小限制开关 + 同名/已处理胶囊弹窗版）
 """
 import gc
 import io
 import math
 import os
 import queue
+import shutil
 import sys
 import threading
 import traceback
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tkinter as tk
@@ -55,14 +51,33 @@ PRESETS = {
     "灰色": "#D9D9D9",
 }
 
-# 默认双模型协同（低内存占用 + 发丝与主体兼顾），第三模型 u2net 按需启用
-ENSEMBLE_MODELS = [
-    ("birefnet-portrait", 0.75),
-    ("isnet-general-use", 0.25),
-]
-OPTIONAL_THIRD_MODEL = ("u2net", 0.15)
+DEFAULT_MODEL = "birefnet-portrait"
 ALL_MODEL_NAMES = ["birefnet-portrait", "isnet-general-use", "u2net"]
-PRIMARY_FALLBACK_MODEL = "birefnet-portrait"
+
+MODEL_RELEASE_URLS = {
+    "birefnet-portrait": "https://github.com/danielgatis/rembg/releases/download/v0.0.0/birefnet-portrait.onnx",
+    "isnet-general-use": "https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-general-use.onnx",
+    "u2net": "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx",
+}
+
+CN_GH_MIRROR_PREFIXES = [
+    "https://gh-proxy.com/",
+    "https://ghproxy.net/",
+    "https://gh.llkk.cc/",
+    "https://ghproxy.cxkpro.top/",
+]
+
+ENSEMBLE_PRESETS = {
+    "双模型叠加 (birefnet + isnet)": [
+        ("birefnet-portrait", 0.75),
+        ("isnet-general-use", 0.25),
+    ],
+    "三模型叠加 (birefnet + isnet + u2net)": [
+        ("birefnet-portrait", 0.65),
+        ("isnet-general-use", 0.20),
+        ("u2net", 0.15),
+    ],
+}
 
 THEME = {
     "bg": "#F1F6FD",
@@ -109,13 +124,13 @@ def _find_existing_model_file(model_name: str) -> Path | None:
     model_dir.mkdir(parents=True, exist_ok=True)
 
     for f in model_dir.rglob("*"):
-        if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS:
+        if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS and f.stat().st_size > 1024 * 100:
             return f
 
     wrong_nested_dir = models_root / "models" / model_name
     if wrong_nested_dir.exists() and wrong_nested_dir.is_dir():
         for f in wrong_nested_dir.rglob("*"):
-            if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS:
+            if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS and f.stat().st_size > 1024 * 100:
                 dst = model_dir / f.name
                 if not dst.exists():
                     dst.write_bytes(f.read_bytes())
@@ -125,7 +140,7 @@ def _find_existing_model_file(model_name: str) -> Path | None:
     if legacy_u2net.exists() and legacy_u2net.is_dir():
         key_token = model_name.lower().replace("-", "_")
         for f in legacy_u2net.iterdir():
-            if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS:
+            if f.is_file() and f.suffix.lower() in MODEL_WEIGHT_EXTS and f.stat().st_size > 1024 * 100:
                 fname_norm = f.stem.lower().replace("-", "_")
                 if model_name.lower() in f.stem.lower() or key_token in fname_norm:
                     dst = model_dir / f.name
@@ -136,7 +151,7 @@ def _find_existing_model_file(model_name: str) -> Path | None:
     return None
 
 
-def prepare_all_models_env() -> Path:
+def prepare_models_env() -> Path:
     u2net_home = get_u2net_home_dir()
     models_root = get_fixed_models_root()
     u2net_home.mkdir(parents=True, exist_ok=True)
@@ -150,18 +165,83 @@ def prepare_all_models_env() -> Path:
     return models_root
 
 
-def check_all_models_status() -> tuple[list[str], list[str]]:
-    prepare_all_models_env()
-    ready, missing = [], []
-    for m_name in ALL_MODEL_NAMES:
-        if _find_existing_model_file(m_name) is not None:
-            ready.append(m_name)
-        else:
-            missing.append(m_name)
-    return ready, missing
+def is_model_ready(model_name: str, custom_file: str = "") -> bool:
+    if custom_file:
+        p = Path(custom_file.strip())
+        if p.is_file() and p.suffix.lower() == ".onnx" and p.stat().st_size > 1024 * 100:
+            return True
+        return False
+    prepare_models_env()
+    return _find_existing_model_file(model_name) is not None
 
 
-APP_MODELS_ROOT = prepare_all_models_env()
+def download_model_via_mirrors(model_name: str, status_cb=None) -> Path:
+    prepare_models_env()
+    existing = _find_existing_model_file(model_name)
+    if existing is not None:
+        return existing
+
+    raw_url = MODEL_RELEASE_URLS.get(model_name)
+    target_dir = get_model_subdir(model_name)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_file = target_dir / f"{model_name}.onnx"
+    temp_file = target_dir / f"{model_name}.onnx.part"
+
+    last_err = ""
+    if raw_url:
+        for idx, prefix in enumerate(CN_GH_MIRROR_PREFIXES, 1):
+            mirror_url = f"{prefix}{raw_url}"
+            if status_cb:
+                status_cb(f"正在通过国内镜像 ({idx}/{len(CN_GH_MIRROR_PREFIXES)}) 下载 {model_name} ……")
+            try:
+                req = urllib.request.Request(
+                    mirror_url,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                )
+                with urllib.request.urlopen(req, timeout=60) as resp, open(temp_file, "wb") as out_f:
+                    total_bytes = int(resp.headers.get("Content-Length") or 0)
+                    downloaded = 0
+                    last_pct = -1
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        out_f.write(chunk)
+                        downloaded += len(chunk)
+                        if status_cb and total_bytes > 0:
+                            pct = int(downloaded * 100 / total_bytes)
+                            if pct >= last_pct + 5:
+                                last_pct = pct
+                                status_cb(
+                                    f"镜像下载 {model_name}：{pct}% ({downloaded // (1024 * 1024)}MB / {total_bytes // (1024 * 1024)}MB)"
+                                )
+                if temp_file.exists() and temp_file.stat().st_size > 1024 * 100:
+                    if target_file.exists():
+                        target_file.unlink()
+                    temp_file.replace(target_file)
+                    return target_file
+            except Exception as e:
+                last_err = f"{mirror_url} -> {e}"
+                if temp_file.exists():
+                    try:
+                        temp_file.unlink()
+                    except Exception:
+                        pass
+
+    if new_session is not None:
+        if status_cb:
+            status_cb(f"镜像源暂不可达，尝试默认通道获取 {model_name} ……")
+        sess = new_session(model_name)
+        del sess
+        gc.collect()
+        found = _find_existing_model_file(model_name)
+        if found is not None:
+            return found
+
+    raise RuntimeError(f"模型 [{model_name}] 下载失败。最后错误：{last_err}")
+
+
+APP_MODELS_ROOT = prepare_models_env()
 
 Image = None
 ImageOps = None
@@ -213,11 +293,29 @@ def resolve_output_root_for_image(src: Path, input_paths: list, base_export_dir:
     return base_export_dir / folder_name, Path(src_resolved.name)
 
 
-def encode_image_under_limit(image, fmt, max_kb):
+def compute_target_output_path(src: Path, input_paths: list, base_out: Path, ext: str) -> tuple[Path, Path]:
+    out_folder, relative = resolve_output_root_for_image(src, input_paths, base_out)
+    target_dir = out_folder / relative.parent
+    target = target_dir / (src.stem + ext)
+    if target.resolve() == src.resolve():
+        target = target_dir / (src.stem + f"_converted{ext}")
+    return out_folder, target
+
+
+def encode_image_output(image, fmt, limit_enabled: bool, max_kb: int):
     fmt_upper = (fmt or "JPG").upper()
-    limit = max(1, int(max_kb)) * 1024
     img = image.convert("RGB")
 
+    # 关闭大小限制：原尺寸、最高质量无限制输出
+    if not limit_enabled:
+        buf = io.BytesIO()
+        if fmt_upper == "PNG":
+            img.save(buf, format="PNG", optimize=True)
+        else:
+            img.save(buf, format="JPEG", quality=95, optimize=True)
+        return buf.getvalue()
+
+    limit = max(1, int(max_kb)) * 1024
     if fmt_upper == "PNG":
         for _ in range(12):
             buf = io.BytesIO()
@@ -281,29 +379,29 @@ class SoftPillCard:
     def __init__(
         self,
         parent,
-        radius=24,
+        radius=22,
         bg_color="#FFFFFF",
         border_color="#D8E4F3",
         parent_bg="#F1F6FD",
-        padx=18,
+        padx=16,
         pady=8,
         outer_pady=(0, 6),
     ):
         self.pill_r = float(radius)
         self.bg_color = bg_color
         self.border_color = border_color
-        self.card_w = 880.0
+        self.card_w = 580.0
         self.card_h = 85.0
 
         self.canvas = tk.Canvas(
             parent,
-            width=880,
+            width=580,
             height=85,
             bg=parent_bg,
             highlightthickness=0,
             bd=0,
         )
-        self.canvas.pack(fill="x", padx=16, pady=outer_pady)
+        self.canvas.pack(fill="x", padx=14, pady=outer_pady)
 
         self.inner = tk.Frame(self.canvas, bg=bg_color, bd=0, highlightthickness=0)
         self.win_id = self.canvas.create_window(
@@ -311,7 +409,7 @@ class SoftPillCard:
             pady,
             window=self.inner,
             anchor="nw",
-            width=840,
+            width=548,
         )
         self.padx = padx
         self.pady = pady
@@ -370,14 +468,14 @@ class SoftPillField:
         self.pill_r = float(radius)
         self.bg_color = bg_color
         self.border_color = border_color
-        self.field_w = 480.0
+        self.field_w = 340.0
         self.field_h = float(height)
         self.padx = padx
         self.pady = pady
 
         self.canvas = tk.Canvas(
             parent,
-            width=480,
+            width=340,
             height=int(height),
             bg=parent_bg,
             highlightthickness=0,
@@ -389,7 +487,7 @@ class SoftPillField:
             pady,
             window=self.inner,
             anchor="nw",
-            width=460,
+            width=320,
             height=max(14, int(height - pady * 2)),
         )
         self.canvas.bind("<Configure>", self._on_resize)
@@ -438,13 +536,13 @@ class SoftPillProgressBar(tk.Canvas):
     ):
         super().__init__(
             parent,
-            width=880,
+            width=580,
             height=int(height),
             bg=parent_bg,
             highlightthickness=0,
             bd=0,
         )
-        self.bar_w = 880.0
+        self.bar_w = 580.0
         self.bar_h = float(height)
         self.track_color = track_color
         self.fill_color = fill_color
@@ -495,7 +593,7 @@ class SoftPillButton(tk.Canvas):
         parent,
         text,
         command=None,
-        width=124,
+        width=112,
         height=28,
         radius=14,
         bg_color="#EBF3FF",
@@ -535,6 +633,10 @@ class SoftPillButton(tk.Canvas):
         self.bind("<Leave>", self._on_leave)
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<ButtonRelease-1>", self._on_release)
+        self._redraw()
+
+    def set_text(self, new_text):
+        self.btn_text = new_text
         self._redraw()
 
     def set_enabled(self, enabled):
@@ -646,8 +748,8 @@ class SoftPillBanner(tk.Canvas):
         self,
         parent,
         main_text,
-        height=42,
-        radius=21,
+        height=40,
+        radius=20,
         bg_color="#EFF6FF",
         hover_color="#DBEAFE",
         border_color="#93C5FD",
@@ -656,14 +758,14 @@ class SoftPillBanner(tk.Canvas):
     ):
         super().__init__(
             parent,
-            width=820,
+            width=540,
             height=int(height),
             bg=parent_bg,
             highlightthickness=0,
             bd=0,
         )
         self.banner_main = main_text
-        self.pill_w = 820.0
+        self.pill_w = 540.0
         self.pill_h = float(height)
         self.pill_r = float(radius)
         self.bg_color = bg_color
@@ -719,7 +821,7 @@ class LoadingWindow:
         self.root = root
         self.win = tk.Toplevel(root)
         self.win.title(SPLASH_DISPLAY_NAME)
-        self.win.geometry("460x172")
+        self.win.geometry("440x168")
         self.win.resizable(False, False)
         self.win.overrideredirect(True)
         self.win.configure(bg=self.TRANSPARENT_KEY)
@@ -743,8 +845,8 @@ class LoadingWindow:
 
         canvas = tk.Canvas(
             self.win,
-            width=460,
-            height=172,
+            width=440,
+            height=168,
             bg=self.TRANSPARENT_KEY,
             highlightthickness=0,
             bd=0,
@@ -755,8 +857,8 @@ class LoadingWindow:
             canvas,
             2,
             2,
-            458,
-            170,
+            438,
+            166,
             r=24,
             fill="#FFFFFF",
             outline="#2563EB",
@@ -764,16 +866,16 @@ class LoadingWindow:
         )
 
         canvas.create_text(
-            230,
-            38,
+            220,
+            36,
             text=SPLASH_DISPLAY_NAME,
             fill="#0F172A",
             font=("Microsoft YaHei UI", 12, "bold"),
         )
         self.status_var = tk.StringVar(value="正在初始化程序环境...")
         self.status_id = canvas.create_text(
-            230,
-            66,
+            220,
+            64,
             text=self.status_var.get(),
             fill="#475569",
             font=("Microsoft YaHei UI", 9),
@@ -784,13 +886,13 @@ class LoadingWindow:
             style="SplashGreen.Horizontal.TProgressbar",
             mode="determinate",
             maximum=100,
-            length=380,
+            length=360,
         )
-        canvas.create_window(230, 102, window=self.bar)
+        canvas.create_window(220, 100, window=self.bar)
 
         canvas.create_text(
-            230,
-            138,
+            220,
+            136,
             text="首次加载 AI 抠图引擎可能需要几十秒，请勿关闭",
             fill="#94A3B8",
             font=("Microsoft YaHei UI", 8),
@@ -801,9 +903,9 @@ class LoadingWindow:
         self.win.update_idletasks()
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
-        x = max(0, (sw - 460) // 2)
-        y = max(0, (sh - 172) // 2)
-        self.win.geometry(f"460x172+{x}+{y}")
+        x = max(0, (sw - 440) // 2)
+        y = max(0, (sh - 168) // 2)
+        self.win.geometry(f"440x168+{x}+{y}")
 
     def update_progress(self, value, text=None):
         try:
@@ -834,11 +936,14 @@ def center_window_on_screen(win, width: int, height: int):
 
 
 class App:
+    RIGHT_BTN_W = 112
+
     def __init__(self, root):
         self.root = root
         self.root.title(APP_DISPLAY_NAME)
-        win_w, win_h = 920, 690
-        self.root.minsize(860, 640)
+        # 竖屏比例窗口，砍半横向宽度，上下舒展排布
+        win_w, win_h = 620, 830
+        self.root.minsize(580, 770)
         self.root.configure(bg=THEME["bg"])
         center_window_on_screen(self.root, win_w, win_h)
 
@@ -856,14 +961,18 @@ class App:
         self._poll_job = None
 
         self.output_dir = tk.StringVar(value=default_output_path)
-        self.use_dual_assist = tk.BooleanVar(value=True)
-        self.include_u2net = tk.BooleanVar(value=False)
-        self.model_status_var = tk.StringVar(value=self._build_model_status_text())
+        self.mode_choice = tk.StringVar(value="single")
+        self.single_model = tk.StringVar(value=DEFAULT_MODEL)
+        self.use_custom_model_path = tk.BooleanVar(value=False)
+        self.custom_model_file = tk.StringVar(value="")
+        self.ensemble_choice = tk.StringVar(value="双模型叠加 (birefnet + isnet)")
+
+        self.fine_edge = tk.BooleanVar(value=True)
         self.color = tk.StringVar(value=PRESETS["蓝色（常用）"])
         self.output_format = tk.StringVar(value="JPG")
+        self.limit_size_enabled = tk.BooleanVar(value=True)
         self.max_kb = tk.IntVar(value=50)
         self.thread_count = tk.IntVar(value=default_threads)
-        self.fine_edge = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="拖入文件夹确认后，再点击下方“开始批量处理”")
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -873,10 +982,11 @@ class App:
             self._build()
         except Exception:
             messagebox.showerror("界面构建错误", traceback.format_exc())
+        self._sync_mode_panels()
+        self._sync_size_limit_state()
         self._poll()
 
     def on_close(self):
-        """确保点击右上角关闭按钮后立即彻底结束进程，不残留后台线程/任务管理器进程"""
         self._closing = True
         if self._poll_job is not None:
             try:
@@ -892,19 +1002,6 @@ class App:
             pass
         os._exit(0)
 
-    def _build_model_status_text(self) -> str:
-        ready, missing = check_all_models_status()
-        if not missing:
-            return f"离线模型已就绪 ({len(ready)}/3)"
-        return f"已就绪 {len(ready)}/3"
-
-    def _refresh_model_status_label(self):
-        txt = self._build_model_status_text()
-        self.model_status_var.set(txt)
-        _, missing = check_all_models_status()
-        if hasattr(self, "model_status_lbl"):
-            self.model_status_lbl.configure(fg=THEME["ok_green"] if not missing else THEME["err_red"])
-
     def _setup_styles(self):
         style = ttk.Style(self.root)
         try:
@@ -912,20 +1009,20 @@ class App:
         except Exception:
             pass
 
-    def _make_pill_card(self, parent, radius=24, outer_pady=(0, 6)):
+    def _make_pill_card(self, parent, radius=22, outer_pady=(0, 6)):
         card = SoftPillCard(
             parent,
             radius=radius,
             bg_color=THEME["card"],
             border_color=THEME["border"],
             parent_bg=THEME["bg"],
-            padx=18,
+            padx=16,
             pady=8,
             outer_pady=outer_pady,
         )
         return card.canvas, card.inner
 
-    def _make_sec_btn(self, parent, text, command, width=124, height=28):
+    def _make_sec_btn(self, parent, text, command, width=112, height=28):
         return SoftPillButton(
             parent,
             text=text,
@@ -1068,15 +1165,23 @@ class App:
                 pass
 
     def _set_images_list(self, new_input_paths, images):
+        old_states = dict(self._img_states)
         self.input_paths = new_input_paths
         self._images = images
-        self._img_states = {str(p.resolve()): "pending" for p in images}
+        self._img_states = {
+            str(p.resolve()): old_states.get(str(p.resolve()), "pending")
+            for p in images
+        }
         self._refresh_list_view(images)
-        self.status.set(f"已找到 {len(images)} 张图片，请点击“开始批量处理”")
+        done_cnt = sum(1 for s in self._img_states.values() if s == "ok")
+        if done_cnt > 0:
+            self.status.set(f"共 {len(images)} 张图片（其中 {done_cnt} 张已完成 ✓），点击“开始批量处理”")
+        else:
+            self.status.set(f"已找到 {len(images)} 张图片，请点击“开始批量处理”")
 
     def _build(self):
         header = tk.Frame(self.root, bg=THEME["bg"])
-        header.pack(fill="x", padx=16, pady=(8, 2))
+        header.pack(fill="x", padx=14, pady=(8, 2))
         tk.Label(
             header,
             text=APP_DISPLAY_NAME,
@@ -1084,33 +1189,34 @@ class App:
             fg=THEME["text"],
             font=("Microsoft YaHei UI", 14, "bold"),
         ).pack(anchor="w")
-        tk.Frame(header, height=6, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
+        tk.Frame(header, height=4, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
 
-        import_outer, import_card = self._make_pill_card(self.root, radius=24)
+        # 卡片 1：导入区
+        import_outer, import_card = self._make_pill_card(self.root, radius=22)
 
         main_hint = (
-            "将整个文件夹或图片拖入此处（整块区域任意位置），确认后手动点击开始"
+            "将整个文件夹或图片拖入此处，确认后手动点击开始"
             if HAS_DND
             else "点击下方“添加照片”或“添加文件夹”选择待处理图片"
         )
         drop_banner = SoftPillBanner(
             import_card,
             main_text=main_hint,
-            height=42,
-            radius=21,
+            height=38,
+            radius=19,
             bg_color=THEME["drop_bg"],
             hover_color=THEME["drop_hover"],
             border_color=THEME["drop_border"],
             main_fg=THEME["drop_fg"],
             parent_bg=THEME["card"],
         )
-        drop_banner.pack(fill="x", pady=(0, 7))
+        drop_banner.pack(fill="x", pady=(0, 6))
 
         btn_row = tk.Frame(import_card, bg=THEME["card"])
-        btn_row.pack(fill="x", pady=(0, 7))
-        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=124, height=28).pack(side="left", padx=(0, 10))
-        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=136, height=28).pack(side="left")
-        self._make_sec_btn(btn_row, "清空", self.clear, width=104, height=28).pack(side="right")
+        btn_row.pack(fill="x", pady=(0, 6))
+        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=108, height=28).pack(side="left", padx=(0, 8))
+        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=116, height=28).pack(side="left")
+        self._make_sec_btn(btn_row, "清空", self.clear, width=96, height=28).pack(side="right")
 
         list_pill = SoftPillField(
             import_card,
@@ -1125,7 +1231,7 @@ class App:
         list_pill.canvas.pack(fill="x")
         self.listbox = tk.Listbox(
             list_pill.inner,
-            height=2,
+            height=3,
             bg=THEME["list_bg"],
             fg=THEME["text"],
             selectbackground=THEME["accent"],
@@ -1139,15 +1245,175 @@ class App:
 
         self._enable_full_drop_zone(import_outer, drop_banner)
 
+        # 卡片 2：处理参数与模型设置（竖屏分块排版，右侧按钮统一对齐）
         _, set_card = self._make_pill_card(self.root, radius=22)
         tk.Label(
             set_card,
-            text="处理参数设置",
+            text="处理参数与模型设置",
             bg=THEME["card"],
             fg=THEME["text"],
             font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(anchor="w", pady=(0, 5))
+        ).pack(anchor="w", pady=(0, 4))
 
+        # 互斥模式行
+        r_mode = tk.Frame(set_card, bg=THEME["card"])
+        r_mode.pack(fill="x", pady=(0, 4))
+        tk.Radiobutton(
+            r_mode,
+            text="选项一：选择单个模型",
+            variable=self.mode_choice,
+            value="single",
+            command=self._sync_mode_panels,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            selectcolor="#EFF6FF",
+            activebackground=THEME["card"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side="left", padx=(0, 18))
+
+        tk.Radiobutton(
+            r_mode,
+            text="选项二：模型叠加引擎",
+            variable=self.mode_choice,
+            value="ensemble",
+            command=self._sync_mode_panels,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            selectcolor="#EFF6FF",
+            activebackground=THEME["card"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side="left")
+
+        # 选项一容器
+        self.single_container = tk.Frame(set_card, bg=THEME["card"])
+
+        # 模型单选行（左列放 3 个模型单选，右列对齐“下载模型”按钮）
+        r_models = tk.Frame(self.single_container, bg=THEME["card"])
+        r_models.pack(fill="x", pady=(0, 4))
+
+        models_left = tk.Frame(r_models, bg=THEME["card"])
+        models_left.pack(side="left", fill="x", expand=True)
+
+        m_radio_row = tk.Frame(models_left, bg=THEME["card"])
+        m_radio_row.pack(fill="x")
+        for m_name in ALL_MODEL_NAMES:
+            tk.Radiobutton(
+                m_radio_row,
+                text=m_name,
+                variable=self.single_model,
+                value=m_name,
+                command=self._sync_mode_panels,
+                bg=THEME["card"],
+                fg=THEME["text"],
+                selectcolor="#EFF6FF",
+                activebackground=THEME["card"],
+                font=("Microsoft YaHei UI", 8),
+            ).pack(side="left", padx=(6, 4))
+
+        self.model_state_lbl = tk.Label(
+            models_left,
+            text="",
+            bg=THEME["card"],
+            fg=THEME["muted"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+        )
+        self.model_state_lbl.pack(anchor="w", padx=(10, 0), pady=(1, 0))
+
+        self.download_model_btn = self._make_sec_btn(
+            r_models,
+            "下载模型",
+            self.download_selected_model_ui,
+            width=self.RIGHT_BTN_W,
+            height=28,
+        )
+        self.download_model_btn.pack(side="right", anchor="n")
+
+        # 自定义路径勾选行 + 下一行路径框与“选择 .onnx”（右对齐）
+        r_custom_chk = tk.Frame(self.single_container, bg=THEME["card"])
+        r_custom_chk.pack(fill="x", pady=(2, 2))
+        tk.Checkbutton(
+            r_custom_chk,
+            text="自定义路径（指定电脑中其他位置的 .onnx 模型文件）",
+            variable=self.use_custom_model_path,
+            command=self._sync_mode_panels,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            selectcolor="#EFF6FF",
+            activebackground=THEME["card"],
+            font=("Microsoft YaHei UI", 9),
+        ).pack(anchor="w", padx=(6, 0))
+
+        r_custom_path = tk.Frame(self.single_container, bg=THEME["card"])
+        r_custom_path.pack(fill="x", pady=(0, 4))
+        custom_pill = SoftPillField(
+            r_custom_path,
+            height=28,
+            radius=14,
+            bg_color="#F8FAFC",
+            border_color="#CBD5E1",
+            parent_bg=THEME["card"],
+            padx=10,
+            pady=3,
+        )
+        custom_pill.canvas.pack(side="left", fill="x", expand=True, padx=(10, 8))
+        self.custom_path_entry = tk.Entry(
+            custom_pill.inner,
+            textvariable=self.custom_model_file,
+            font=("Microsoft YaHei UI", 8),
+            bg="#F8FAFC",
+            fg=THEME["text"],
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self.custom_path_entry.pack(fill="both", expand=True)
+
+        self.pick_onnx_btn = self._make_sec_btn(
+            r_custom_path,
+            "选择 .onnx",
+            self.choose_custom_onnx_file,
+            width=self.RIGHT_BTN_W,
+            height=28,
+        )
+        self.pick_onnx_btn.pack(side="right")
+
+        # 选项二容器
+        self.ensemble_container = tk.Frame(set_card, bg=THEME["card"])
+        tk.Label(
+            self.ensemble_container,
+            text="叠加方案：",
+            bg=THEME["card"],
+            fg=THEME["text"],
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side="left", padx=(8, 6))
+        self.ensemble_combo = ttk.Combobox(
+            self.ensemble_container,
+            textvariable=self.ensemble_choice,
+            values=list(ENSEMBLE_PRESETS.keys()),
+            state="readonly",
+            width=36,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self.ensemble_combo.pack(side="left")
+
+        self.mode_anchor = tk.Frame(set_card, bg=THEME["card"])
+        self.mode_anchor.pack(fill="x")
+
+        # 精细发丝去白边（上移到自定义路径下方、背景颜色上方）
+        r_fine = tk.Frame(set_card, bg=THEME["card"])
+        r_fine.pack(fill="x", pady=(2, 6))
+        tk.Checkbutton(
+            r_fine,
+            text="精细发丝去白边（清理发丝与浅色衣领杂边，保留浅色外套轮廓）",
+            variable=self.fine_edge,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            selectcolor="#EFF6FF",
+            activebackground=THEME["card"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(anchor="w")
+
+        # 背景颜色行（右侧“自定义颜色”与上方“下载模型”“选择 .onnx”垂直对齐）
         r1 = tk.Frame(set_card, bg=THEME["card"])
         r1.pack(fill="x", pady=(0, 6))
         tk.Label(r1, text="背景颜色：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
@@ -1155,20 +1421,14 @@ class App:
             r1,
             values=list(PRESETS.keys()) + ["自定义颜色"],
             state="readonly",
-            width=20,
+            width=15,
             font=("Microsoft YaHei UI", 9),
         )
         self.preset.set("蓝色（常用）")
-        self.preset.pack(side="left", padx=(6, 10))
+        self.preset.pack(side="left", padx=(4, 8))
         self.preset.bind("<<ComboboxSelected>>", self._preset_changed)
 
-        self.swatch = tk.Label(
-            r1,
-            text="     ",
-            bg=self.color.get(),
-            relief="flat",
-            bd=0,
-        )
+        self.swatch = tk.Label(r1, text="    ", bg=self.color.get(), relief="flat", bd=0)
         self.swatch.pack(side="left", padx=(0, 6))
 
         self.hex_label = tk.Label(
@@ -1178,109 +1438,83 @@ class App:
             fg=THEME["text"],
             font=("Microsoft YaHei UI", 9),
         )
-        self.hex_label.pack(side="left", padx=(0, 8))
-        self._make_sec_btn(r1, "自定义颜色", self.choose_color, width=124, height=28).pack(side="right")
+        self.hex_label.pack(side="left")
 
-        # 模型协同与低占用开关行（拉宽窗口后空间充裕，文字完整显示）
-        r_model = tk.Frame(set_card, bg=THEME["card"])
-        r_model.pack(fill="x", pady=(0, 6))
-        tk.Checkbutton(
-            r_model,
-            text="isnet 防漏抠兜底",
-            variable=self.use_dual_assist,
-            bg=THEME["card"],
-            fg=THEME["text"],
-            selectcolor="#EFF6FF",
-            activebackground=THEME["card"],
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(side="left", padx=(0, 14))
-
-        tk.Checkbutton(
-            r_model,
-            text="叠加 u2net（更重）",
-            variable=self.include_u2net,
-            bg=THEME["card"],
-            fg=THEME["text"],
-            selectcolor="#EFF6FF",
-            activebackground=THEME["card"],
-            font=("Microsoft YaHei UI", 9),
-        ).pack(side="left", padx=(0, 14))
-
-        _, missing_init = check_all_models_status()
-        self.model_status_lbl = tk.Label(
-            r_model,
-            textvariable=self.model_status_var,
-            bg=THEME["card"],
-            fg=THEME["ok_green"] if not missing_init else THEME["err_red"],
-            font=("Microsoft YaHei UI", 9, "bold"),
-        )
-        self.model_status_lbl.pack(side="left")
-
-        self.download_model_btn = self._make_sec_btn(
-            r_model,
-            "补全离线模型",
-            self.download_all_models_ui,
-            width=124,
+        self._make_sec_btn(
+            r1,
+            "自定义颜色",
+            self.choose_color,
+            width=self.RIGHT_BTN_W,
             height=28,
-        )
-        self.download_model_btn.pack(side="right")
+        ).pack(side="right")
 
+        # 输出格式 + 大小限制开关 + KB 上限
         r2 = tk.Frame(set_card, bg=THEME["card"])
-        r2.pack(fill="x", pady=(0, 6))
+        r2.pack(fill="x", pady=(0, 4))
         tk.Label(r2, text="输出格式：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
         self.format_combo = ttk.Combobox(
             r2,
             textvariable=self.output_format,
             values=["JPG", "PNG"],
             state="readonly",
-            width=10,
+            width=7,
             font=("Microsoft YaHei UI", 9),
         )
-        self.format_combo.pack(side="left", padx=(6, 16))
+        self.format_combo.pack(side="left", padx=(4, 12))
 
-        tk.Label(r2, text="大小上限：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
-        ttk.Spinbox(
-            r2,
-            from_=10,
-            to=2000,
-            textvariable=self.max_kb,
-            width=10,
-            font=("Microsoft YaHei UI", 9),
-        ).pack(side="left", padx=(6, 4))
-        tk.Label(r2, text="KB", bg=THEME["card"], fg=THEME["muted"], font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(0, 16))
-
-        tk.Label(r2, text="并发线程：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
-        ttk.Spinbox(
-            r2,
-            from_=1,
-            to=4,
-            textvariable=self.thread_count,
-            width=8,
-            font=("Microsoft YaHei UI", 9),
-        ).pack(side="left", padx=(6, 4))
-        tk.Label(r2, text="线程（建议1~2）", bg=THEME["card"], fg=THEME["muted"], font=("Microsoft YaHei UI", 9)).pack(side="left")
-
-        r_fine = tk.Frame(set_card, bg=THEME["card"])
-        r_fine.pack(fill="x")
         tk.Checkbutton(
-            r_fine,
-            text="精细发丝去白边（清理发丝浅色杂边，同时保留浅色外套与肩膀轮廓）",
-            variable=self.fine_edge,
+            r2,
+            text="限制大小",
+            variable=self.limit_size_enabled,
+            command=self._sync_size_limit_state,
             bg=THEME["card"],
             fg=THEME["text"],
             selectcolor="#EFF6FF",
             activebackground=THEME["card"],
             font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(anchor="w")
+        ).pack(side="left", padx=(0, 4))
 
+        self.max_kb_spin = ttk.Spinbox(
+            r2,
+            from_=10,
+            to=5000,
+            textvariable=self.max_kb,
+            width=7,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self.max_kb_spin.pack(side="left", padx=(2, 4))
+        self.max_kb_unit_lbl = tk.Label(
+            r2,
+            text="KB（关闭则原尺寸输出）",
+            bg=THEME["card"],
+            fg=THEME["muted"],
+            font=("Microsoft YaHei UI", 8),
+        )
+        self.max_kb_unit_lbl.pack(side="left")
+
+        # 并发线程单独一行，竖屏更宽松
+        r_th = tk.Frame(set_card, bg=THEME["card"])
+        r_th.pack(fill="x")
+        tk.Label(r_th, text="并发线程：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
+        ttk.Spinbox(
+            r_th,
+            from_=1,
+            to=4,
+            textvariable=self.thread_count,
+            width=6,
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side="left", padx=(4, 4))
+        tk.Label(r_th, text="线程（建议 1）", bg=THEME["card"], fg=THEME["muted"], font=("Microsoft YaHei UI", 8)).pack(side="left")
+
+        # 卡片 3：导出位置
         _, dir_card = self._make_pill_card(self.root, radius=22, outer_pady=(0, 2))
         tk.Label(
             dir_card,
-            text="导出位置（将自动在所选位置下生成同名文件夹，如导入 16 则导出为 <所选位置>\\16）",
+            text="导出位置（自动生成同名文件夹，如导入 16 则导出为 <所选位置>\\16）",
             bg=THEME["card"],
             fg=THEME["text"],
             font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(anchor="w", pady=(0, 3))
+        ).pack(anchor="w", pady=(0, 4))
 
         r3 = tk.Frame(dir_card, bg=THEME["card"])
         r3.pack(fill="x")
@@ -1291,10 +1525,10 @@ class App:
             bg_color="#F8FAFC",
             border_color="#CBD5E1",
             parent_bg=THEME["card"],
-            padx=12,
+            padx=10,
             pady=3,
         )
-        out_pill.canvas.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        out_pill.canvas.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.out_entry = tk.Entry(
             out_pill.inner,
             textvariable=self.output_dir,
@@ -1306,13 +1540,14 @@ class App:
             highlightthickness=0,
         )
         self.out_entry.pack(fill="both", expand=True)
-        self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=96, height=28).pack(side="left", padx=(0, 8))
-        self._make_sec_btn(r3, "浏览", self.choose_output, width=96, height=28).pack(side="right")
+        self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=78, height=28).pack(side="left", padx=(0, 6))
+        self._make_sec_btn(r3, "浏览", self.choose_output, width=78, height=28).pack(side="right")
 
+        # 底部进度与主按钮
         bottom = tk.Frame(self.root, bg=THEME["bg"])
-        bottom.pack(fill="x", padx=16, pady=(0, 10))
+        bottom.pack(fill="x", padx=14, pady=(0, 10))
 
-        tk.Frame(bottom, height=16, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
+        tk.Frame(bottom, height=8, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
 
         self.progress = SoftPillProgressBar(
             bottom,
@@ -1334,7 +1569,7 @@ class App:
             bottom,
             text="开始批量处理",
             command=self.start,
-            width=880,
+            width=580,
             height=38,
             radius=19,
             bg_color=THEME["accent"],
@@ -1351,6 +1586,57 @@ class App:
                 self.start_btn.set_width(event.width)
 
         bottom.bind("<Configure>", _sync_start_width)
+
+    def _sync_size_limit_state(self):
+        enabled = bool(self.limit_size_enabled.get())
+        self.max_kb_spin.configure(state="normal" if enabled else "disabled")
+        if enabled:
+            self.max_kb_unit_lbl.configure(text="KB（超出自动压缩）", fg=THEME["muted"])
+        else:
+            self.max_kb_unit_lbl.configure(text="KB（已关闭：原像素尺寸无限制输出）", fg=THEME["accent"])
+
+    def _sync_mode_panels(self):
+        is_single = (self.mode_choice.get() == "single")
+        if is_single:
+            self.ensemble_container.pack_forget()
+            self.single_container.pack(fill="x", before=self.mode_anchor)
+        else:
+            self.single_container.pack_forget()
+            self.ensemble_container.pack(fill="x", before=self.mode_anchor)
+
+        use_custom = bool(self.use_custom_model_path.get())
+        self.custom_path_entry.configure(state="normal" if (is_single and use_custom) else "disabled")
+        self.pick_onnx_btn.set_enabled(is_single and use_custom and not self._is_downloading_model and not self._is_running)
+
+        chosen = self.single_model.get()
+        custom_p = self.custom_model_file.get().strip() if use_custom else ""
+        ready = is_model_ready(chosen, custom_file=custom_p)
+
+        if use_custom:
+            if ready:
+                self.model_state_lbl.configure(text="自定义 .onnx：已找到", fg=THEME["ok_green"])
+            else:
+                self.model_state_lbl.configure(text="自定义 .onnx：未选择或无效", fg=THEME["err_red"])
+            self.download_model_btn.set_text("下载模型")
+            self.download_model_btn.set_enabled(False)
+        else:
+            if ready:
+                self.model_state_lbl.configure(text=f"{chosen}：已下载", fg=THEME["ok_green"])
+                self.download_model_btn.set_text("已就绪")
+                self.download_model_btn.set_enabled(False)
+            else:
+                self.model_state_lbl.configure(text=f"{chosen}：未下载", fg=THEME["err_red"])
+                self.download_model_btn.set_text("下载模型")
+                self.download_model_btn.set_enabled(not self._is_downloading_model and not self._is_running)
+
+    def choose_custom_onnx_file(self):
+        file_path = filedialog.askopenfilename(
+            title="选择 .onnx 模型文件",
+            filetypes=[("ONNX 模型文件", "*.onnx"), ("所有文件", "*.*")],
+        )
+        if file_path:
+            self.custom_model_file.set(str(Path(file_path)))
+            self._sync_mode_panels()
 
     def _add_paths(self, paths):
         valid = [p for p in paths if Path(p).exists()]
@@ -1416,63 +1702,166 @@ class App:
         if value.upper() not in {v.upper() for v in PRESETS.values()}:
             self.preset.set("自定义颜色")
 
-    def _get_selected_model_specs(self):
-        specs = [("birefnet-portrait", 0.75)]
-        if self.use_dual_assist.get():
-            specs.append(("isnet-general-use", 0.25))
-        if self.include_u2net.get():
-            specs.append(OPTIONAL_THIRD_MODEL)
-        return specs
-
-    def download_all_models_ui(self):
+    def download_selected_model_ui(self):
         if self._is_downloading_model or self._is_running:
-            messagebox.showinfo("提示", "当前有任务正在执行，请稍候。")
             return
-        if new_session is None:
-            messagebox.showerror("下载失败", "缺少 rembg 组件，请检查打包是否完整。")
-            return
-
-        _, missing = check_all_models_status()
-        models_root = get_fixed_models_root()
-        if not missing:
-            self._refresh_model_status_label()
-            messagebox.showinfo(
-                "模型已完备",
-                f"全部 3 个离线模型均已就绪：\n"
-                f"• birefnet-portrait\n• isnet-general-use\n• u2net\n\n存放目录：{models_root}",
-            )
+        target_model = self.single_model.get()
+        if is_model_ready(target_model):
+            self._sync_mode_panels()
             return
 
         self._is_downloading_model = True
         self.download_model_btn.set_enabled(False)
         self.start_btn.set_enabled(False)
-        self.status.set(f"正在下载缺失模型到 {models_root} ……")
+        self.status.set(f"正在通过国内镜像下载模型 [{target_model}] ……")
 
         def _dl_worker():
             try:
-                prepare_all_models_env()
-                for idx, m_name in enumerate(ALL_MODEL_NAMES, 1):
-                    if self._closing:
-                        return
-                    if _find_existing_model_file(m_name) is not None:
-                        continue
-                    self.msgq.put(("status", f"正在下载模型 ({idx}/3)：[{m_name}] ……"))
-                    sess = new_session(m_name)
-                    del sess
-                    gc.collect()
+                saved_path = download_model_via_mirrors(
+                    target_model,
+                    status_cb=lambda msg: self.msgq.put(("status", msg)) if not self._closing else None,
+                )
                 if not self._closing:
-                    self.msgq.put(("model_dl_done", True, "离线模型", str(models_root)))
+                    self.msgq.put(("model_dl_done", True, target_model, str(saved_path)))
             except Exception:
                 if not self._closing:
-                    self.msgq.put(("model_dl_done", False, "离线模型", traceback.format_exc()))
+                    self.msgq.put(("model_dl_done", False, target_model, traceback.format_exc()))
 
         threading.Thread(target=_dl_worker, daemon=True).start()
+
+    def _ask_conflict_or_done_policy(self, done_count: int, disk_exist_count: int, overlap_total: int, total_count: int) -> str | None:
+        """
+        收窄的胶囊按钮确认弹窗：
+        检测列表中已打 ✓ 的记录以及目标输出文件夹中已存在的同名文件，
+        返回 "regen"（替换/重新生成）、"skip"（跳过不生成）或 None（取消）。
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("已存在 / 已处理文件确认")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        dlg.configure(bg=THEME["bg"])
+        center_window_on_screen(dlg, 410, 210)
+
+        card = SoftPillCard(
+            dlg,
+            radius=22,
+            bg_color=THEME["card"],
+            border_color=THEME["border"],
+            parent_bg=THEME["bg"],
+            padx=18,
+            pady=14,
+            outer_pady=(10, 10),
+        )
+        box = card.inner
+
+        choice = {"val": None}
+
+        detail_parts = []
+        if done_count > 0:
+            detail_parts.append(f"列表已处理(✓) {done_count} 张")
+        if disk_exist_count > 0:
+            detail_parts.append(f"导出目录已有同名文件 {disk_exist_count} 张")
+        detail_str = "，".join(detail_parts)
+
+        tk.Label(
+            box,
+            text=f"共 {total_count} 张待处理（涉及重复/已完成 {overlap_total} 张）",
+            bg=THEME["card"],
+            fg=THEME["text"],
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(pady=(2, 4))
+
+        tk.Label(
+            box,
+            text=f"{detail_str}\n请选择统一处理方式：",
+            bg=THEME["card"],
+            fg=THEME["muted"],
+            font=("Microsoft YaHei UI", 9),
+            justify="center",
+        ).pack(pady=(0, 14))
+
+        btn_row = tk.Frame(box, bg=THEME["card"])
+        btn_row.pack(pady=(0, 4))
+
+        def _pick(v):
+            choice["val"] = v
+            dlg.destroy()
+
+        SoftPillButton(
+            btn_row,
+            text="替换重新生成",
+            command=lambda: _pick("regen"),
+            width=118,
+            height=32,
+            radius=16,
+            bg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"],
+            fg_color="#FFFFFF",
+            wave_color="#BFDBFE",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            parent_bg=THEME["card"],
+        ).pack(side="left", padx=5)
+
+        SoftPillButton(
+            btn_row,
+            text="跳过不生成",
+            command=lambda: _pick("skip"),
+            width=108,
+            height=32,
+            radius=16,
+            bg_color=THEME["btn_sec"],
+            hover_color=THEME["btn_sec_hover"],
+            fg_color=THEME["btn_sec_fg"],
+            wave_color="#93C5FD",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            parent_bg=THEME["card"],
+        ).pack(side="left", padx=5)
+
+        SoftPillButton(
+            btn_row,
+            text="取消",
+            command=lambda: _pick(None),
+            width=74,
+            height=32,
+            radius=16,
+            bg_color="#F1F5F9",
+            hover_color="#E2E8F0",
+            fg_color=THEME["muted"],
+            wave_color="#CBD5E1",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            parent_bg=THEME["card"],
+        ).pack(side="left", padx=5)
+
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(None))
+        self.root.wait_window(dlg)
+        return choice["val"]
+
+    def _get_target_model_specs(self):
+        if self.mode_choice.get() == "single":
+            m_name = self.single_model.get()
+            custom_p = self.custom_model_file.get().strip() if self.use_custom_model_path.get() else ""
+            return [(m_name, 1.0, custom_p)]
+        specs = ENSEMBLE_PRESETS.get(self.ensemble_choice.get(), ENSEMBLE_PRESETS["双模型叠加 (birefnet + isnet)"])
+        return [(m_name, w, "") for m_name, w in specs]
+
+    def _build_session_for_spec(self, m_name: str, custom_p: str):
+        if custom_p:
+            src_onnx = Path(custom_p)
+            if not src_onnx.is_file():
+                raise FileNotFoundError(f"自定义模型文件不存在：{src_onnx}")
+            target_dir = get_model_subdir(m_name)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            linked_onnx = target_dir / f"{m_name}.onnx"
+            if src_onnx.resolve() != linked_onnx.resolve():
+                shutil.copy2(src_onnx, linked_onnx)
+        return new_session(m_name)
 
     def start(self):
         if self._is_running or self._is_downloading_model or self._closing:
             return
-        images = list(getattr(self, "_images", []))
-        if not images:
+        all_images = list(getattr(self, "_images", []))
+        if not all_images:
             messagebox.showwarning("提示", "请先添加照片或文件夹。")
             return
         out_str = self.output_dir.get().strip()
@@ -1499,26 +1888,84 @@ class App:
         except Exception:
             workers = 1
 
-        self._img_states = {str(p.resolve()): "pending" for p in images}
-        self._refresh_list_view(images)
+        target_specs = self._get_target_model_specs()
+        missing_models = [
+            m_name for m_name, _, custom_p in target_specs
+            if not is_model_ready(m_name, custom_file=custom_p)
+        ]
+        if missing_models:
+            messagebox.showwarning(
+                "模型尚未就绪",
+                f"当前任务需要模型：{', '.join(missing_models)}\n\n"
+                f"请先在“选项一：选择单个模型”中下载该模型，或勾选“自定义路径”选择对应的 .onnx 文件。",
+            )
+            return
 
-        models_root = prepare_all_models_env()
-        target_specs = self._get_selected_model_specs()
         fmt = (self.output_format.get() or "JPG").upper()
-        fine_edge = bool(self.fine_edge.get())
-        max_kb_val = int(self.max_kb.get())
+        ext = ".png" if fmt == "PNG" else ".jpg"
         input_paths_snapshot = list(self.input_paths)
+
+        # 同时检测：1) 列表中已打 ✓ 的项；2) 目标导出目录中已存在同名文件的项
+        done_set = set()
+        disk_exist_set = set()
+        for p in all_images:
+            key = str(p.resolve())
+            if self._img_states.get(key) == "ok":
+                done_set.add(key)
+            _, target_file = compute_target_output_path(p, input_paths_snapshot, base_out, ext)
+            if target_file.exists():
+                disk_exist_set.add(key)
+
+        overlap_keys = done_set | disk_exist_set
+        if overlap_keys:
+            policy = self._ask_conflict_or_done_policy(
+                done_count=len(done_set),
+                disk_exist_count=len(disk_exist_set),
+                overlap_total=len(overlap_keys),
+                total_count=len(all_images),
+            )
+            if policy is None:
+                return
+            if policy == "skip":
+                images_to_run = [p for p in all_images if str(p.resolve()) not in overlap_keys]
+                for p in all_images:
+                    key = str(p.resolve())
+                    if key in overlap_keys:
+                        self._img_states[key] = "ok"
+                    else:
+                        self._img_states[key] = "pending"
+                self._refresh_list_view(all_images)
+                if not images_to_run:
+                    self.status.set("所有重复/已完成文件均已跳过")
+                    messagebox.showinfo("提示", "所选文件均已存在或已完成，已全部跳过。")
+                    return
+            else:
+                images_to_run = list(all_images)
+                for p in images_to_run:
+                    self._img_states[str(p.resolve())] = "pending"
+                self._refresh_list_view(all_images)
+        else:
+            images_to_run = list(all_images)
+            for p in images_to_run:
+                self._img_states[str(p.resolve())] = "pending"
+            self._refresh_list_view(all_images)
+
+        prepare_models_env()
+        fine_edge = bool(self.fine_edge.get())
+        limit_enabled = bool(self.limit_size_enabled.get())
+        max_kb_val = int(self.max_kb.get())
 
         self._is_running = True
         mode_desc = "+".join(m[0] for m in target_specs)
-        self.status.set(f"正在加载 [{mode_desc}]（{models_root}）……")
+        self.status.set(f"正在加载模型 [{mode_desc}] ……")
         self.start_btn.set_enabled(False)
         self.download_model_btn.set_enabled(False)
-        self.progress.configure(maximum=len(images), value=0)
+        self.pick_onnx_btn.set_enabled(False)
+        self.progress.configure(maximum=len(images_to_run), value=0)
 
         threading.Thread(
             target=self._worker,
-            args=(images, input_paths_snapshot, base_out, rgb, fmt, max_kb_val, target_specs, fine_edge, workers),
+            args=(images_to_run, input_paths_snapshot, base_out, rgb, fmt, limit_enabled, max_kb_val, target_specs, fine_edge, workers),
             daemon=True,
         ).start()
 
@@ -1534,6 +1981,9 @@ class App:
         return alpha
 
     def _fuse_alphas(self, im_rgba, weighted_sessions):
+        if len(weighted_sessions) == 1:
+            return self._run_model_alpha(im_rgba, weighted_sessions[0][2])
+
         chops = ImageChops
         if chops is None:
             from PIL import ImageChops as _chops
@@ -1544,7 +1994,7 @@ class App:
 
         for m_name, _weight, sess in weighted_sessions:
             a = self._run_model_alpha(im_rgba, sess)
-            if m_name == "birefnet-portrait" and portrait_alpha is None:
+            if m_name == DEFAULT_MODEL and portrait_alpha is None:
                 portrait_alpha = a
             else:
                 support_alphas.append(a)
@@ -1661,7 +2111,7 @@ class App:
         cut_cleaned.close()
         return res
 
-    def _process_single_image(self, src: Path, input_paths: list, weighted_sessions, base_out: Path, rgb, fmt, max_kb, fine_edge, ext):
+    def _process_single_image(self, src: Path, input_paths: list, weighted_sessions, base_out: Path, rgb, fmt, limit_enabled: bool, max_kb: int, fine_edge: bool, ext: str):
         im = None
         a_ch = None
         result = None
@@ -1670,13 +2120,9 @@ class App:
             a_ch = self._fuse_alphas(im, weighted_sessions)
             result = self._clean_fringe_and_composite(im, a_ch, rgb, fine_edge)
 
-            out_folder, relative = resolve_output_root_for_image(src, input_paths, base_out)
-            target_dir = out_folder / relative.parent
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target = target_dir / (src.stem + ext)
-            if target.exists() and src.suffix.lower() != ext:
-                target = target_dir / (src.stem + f"_converted{ext}")
-            data = encode_image_under_limit(result, fmt, max_kb)
+            out_folder, target = compute_target_output_path(src, input_paths, base_out, ext)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            data = encode_image_output(result, fmt, limit_enabled, max_kb)
             target.write_bytes(data)
             return out_folder
         finally:
@@ -1687,7 +2133,7 @@ class App:
                     except Exception:
                         pass
 
-    def _worker(self, images, input_paths, base_out, rgb, fmt, max_kb, target_specs, fine_edge, workers):
+    def _worker(self, images, input_paths, base_out, rgb, fmt, limit_enabled, max_kb, target_specs, fine_edge, workers):
         weighted_sessions = []
         executor = None
         try:
@@ -1695,31 +2141,25 @@ class App:
                 self.msgq.put(("fatal", "缺少 rembg 组件，请检查打包是否完整。"))
                 return
 
-            models_root = prepare_all_models_env()
+            prepare_models_env()
 
-            for idx, (m_name, weight) in enumerate(target_specs, 1):
+            for idx, (m_name, weight, custom_p) in enumerate(target_specs, 1):
                 if self._closing:
                     return
-                m_dir = get_model_subdir(m_name)
-                existing_file = _find_existing_model_file(m_name)
-                if existing_file is not None:
-                    self.msgq.put(("status", f"正在加载模型 ({idx}/{len(target_specs)})：{m_name} ……"))
-                else:
-                    self.msgq.put(("status", f"正在下载模型 ({idx}/{len(target_specs)})：{m_name} ……"))
+                self.msgq.put(("status", f"正在加载模型 ({idx}/{len(target_specs)})：{m_name} ……"))
                 try:
-                    sess = new_session(m_name)
+                    sess = self._build_session_for_spec(m_name, custom_p)
                     weighted_sessions.append((m_name, weight, sess))
                 except Exception as e:
                     self.msgq.put((
                         "fatal",
-                        f"AI 模型 [{m_name}] 加载或下载失败：{e}\n固定模型目录：{m_dir}\n（若处于离线环境，请确认安装包已完整包含 {models_root}）",
+                        f"AI 模型 [{m_name}] 加载失败：{e}\n模型目录：{get_model_subdir(m_name)}",
                     ))
                     return
 
             if self._closing:
                 return
 
-            self.msgq.put(("refresh_model_status",))
             engine_tip = "+".join(m[0] for m in target_specs)
             self.msgq.put(("status", f"[{engine_tip}] 已就绪，开始处理 {len(images)} 张图片……"))
 
@@ -1741,6 +2181,7 @@ class App:
                     base_out,
                     rgb,
                     fmt,
+                    limit_enabled,
                     max_kb,
                     fine_edge,
                     ext,
@@ -1813,20 +2254,17 @@ class App:
                 kind = item[0]
                 if kind == "status":
                     self.status.set(item[1])
-                elif kind == "refresh_model_status":
-                    self._refresh_model_status_label()
                 elif kind == "model_dl_done":
                     _, ok_flag, m_name, info_str = item
                     self._is_downloading_model = False
-                    self.download_model_btn.set_enabled(True)
                     self.start_btn.set_enabled(True)
-                    self._refresh_model_status_label()
+                    self._sync_mode_panels()
                     if ok_flag:
-                        self.status.set(f"{m_name} 已就绪（{info_str}）")
-                        messagebox.showinfo("下载完成", f"{m_name} 已准备就绪：\n{info_str}")
+                        self.status.set(f"模型 [{m_name}] 已下载就绪")
+                        messagebox.showinfo("下载完成", f"模型 [{m_name}] 已下载并准备就绪：\n{info_str}")
                     else:
-                        self.status.set(f"{m_name} 下载失败")
-                        messagebox.showerror("下载失败", f"{m_name} 下载出错：\n{info_str}")
+                        self.status.set(f"模型 [{m_name}] 下载失败")
+                        messagebox.showerror("下载失败", f"模型 [{m_name}] 下载出错：\n{info_str}")
                 elif kind == "item_done":
                     _, src, state, v, total, msg = item
                     self._mark_image_state(src, state)
@@ -1835,14 +2273,14 @@ class App:
                 elif kind == "fatal":
                     self._is_running = False
                     self.start_btn.set_enabled(True)
-                    self.download_model_btn.set_enabled(True)
+                    self._sync_mode_panels()
                     self.status.set("处理中止，请查看错误提示")
                     messagebox.showerror("无法处理", item[1])
                 elif kind == "done":
                     _, ok, total, errors, out_summary = item
                     self._is_running = False
                     self.start_btn.set_enabled(True)
-                    self.download_model_btn.set_enabled(True)
+                    self._sync_mode_panels()
                     self.status.set(f"完成：成功 {ok} 张，失败 {len(errors)} 张")
                     msg = f"处理完成！\n成功：{ok}/{total} 张\n导出文件夹：{out_summary}"
                     if errors:
@@ -1854,29 +2292,21 @@ class App:
             self._poll_job = self.root.after(100, self._poll)
 
 
-def cli_download_all_models() -> int:
+def cli_download_default_model() -> int:
     try:
-        models_root = prepare_all_models_env()
-        print(f"[INFO] 固定模型根目录: {models_root}")
-        from rembg import new_session as _new_session
-        for idx, m_name in enumerate(ALL_MODEL_NAMES, 1):
-            print(f"[INFO] ({idx}/3) 正在准备模型: {m_name} ...")
-            sess = _new_session(m_name)
-            del sess
-            gc.collect()
-            found = _find_existing_model_file(m_name)
-            print(f"[OK]   模型 {m_name} 已就绪 -> {found}")
-        print("[SUCCESS] 全部 3 个离线模型已下载并归整完成！")
+        prepare_models_env()
+        saved = download_model_via_mirrors(DEFAULT_MODEL, status_cb=lambda msg: print(f"[INFO] {msg}"))
+        print(f"[SUCCESS] 默认模型 {DEFAULT_MODEL} 已就绪 -> {saved}")
         return 0
     except Exception as e:
-        print(f"[ERROR] 模型预下载失败: {e}")
+        print(f"[ERROR] 默认模型下载失败: {e}")
         traceback.print_exc()
         return 1
 
 
 def main():
-    if "--download-all-models" in sys.argv:
-        sys.exit(cli_download_all_models())
+    if "--download-default-model" in sys.argv:
+        sys.exit(cli_download_default_model())
 
     global Image, ImageOps, ImageFilter, ImageChops, remove, new_session
 
@@ -1892,7 +2322,7 @@ def main():
         def load_deps():
             global Image, ImageOps, ImageFilter, ImageChops, remove, new_session
             try:
-                prepare_all_models_env()
+                prepare_models_env()
                 load_q.put(("STAGE", 20.0, "正在准备图像解码组件 (Pillow)..."))
                 from PIL import (
                     Image as _Image,

@@ -14,7 +14,7 @@ on:
           - all
 
 env:
-  APP_VERSION: "3.1.0.1"
+  APP_VERSION: "4.0.0.0"
 
 permissions:
   contents: write
@@ -37,11 +37,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller pillow rembg onnxruntime tkinterdnd2
 
-      - name: 4. 预下载全部三套离线 AI 抠图模型 (birefnet-portrait / isnet-general-use / u2net)
+      - name: 4. 预下载默认离线 AI 抠图模型 (仅 birefnet-portrait)
         env:
           U2NET_HOME: ${{ github.workspace }}\build_u2net\.u2net
+        shell: pwsh
         run: |
-          python -c "import os, gc; os.makedirs(os.environ['U2NET_HOME'], exist_ok=True); from rembg import new_session; models = ['birefnet-portrait', 'isnet-general-use', 'u2net']; [ (print(f'Downloading {m}...'), globals().__setitem__('_s', new_session(m)), globals().__setitem__('_s', None), gc.collect()) for m in models ]"
+          New-Item -ItemType Directory -Force -Path "$env:U2NET_HOME\models\birefnet-portrait" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$env:U2NET_HOME\models\isnet-general-use" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$env:U2NET_HOME\models\u2net" | Out-Null
+          python -c "import os, gc; os.makedirs(os.environ['U2NET_HOME'], exist_ok=True); from rembg import new_session; print('Downloading birefnet-portrait...'); s = new_session('birefnet-portrait'); del s; gc.collect()"
+          # 确保模型文件位于 models\birefnet-portrait 子目录下，避免散落在根目录
+          Get-ChildItem -Path "$env:U2NET_HOME" -File -Include *.onnx,*.pth,*.pt | ForEach-Object {
+            if ($_.Name -like "*birefnet*") {
+              Move-Item -Path $_.FullName -Destination "$env:U2NET_HOME\models\birefnet-portrait\$($_.Name)" -Force
+            }
+          }
 
       - name: 5. 生成与 APP_VERSION 同步的 EXE 版本信息文件
         shell: pwsh
@@ -86,52 +96,11 @@ jobs:
           "@
           Set-Content -Path "version_info.txt" -Value $content -Encoding UTF8
 
-      - name: 6. 使用 PyInstaller 打包免安装文件夹（含版本信息、元数据与三套离线模型）
+      - name: 6. 使用 PyInstaller 打包免安装文件夹（含版本信息、元数据与默认离线模型）
         shell: pwsh
         run: |
           $entryScript = if (Test-Path "证件照批量换底色_2.py") { "证件照批量换底色_2.py" } else { "证件照批量换底色.py" }
           pyinstaller --noconfirm --clean --onedir --windowed `
             --name "证件照批量换底色工具_Czq" `
             --icon "app.ico" `
-            --version-file "version_info.txt" `
-            --copy-metadata pymatting `
-            --collect-all tkinterdnd2 `
-            --collect-all rembg `
-            --add-data "app.ico;." `
-            --add-data "build_u2net\.u2net;.u2net" `
-            $entryScript
-
-          $srcModels = "${{ github.workspace }}\build_u2net\.u2net\models"
-          $dstModels = "${{ github.workspace }}\dist\证件照批量换底色工具_Czq\_internal\.u2net\models"
-          if (Test-Path $srcModels) {
-            New-Item -ItemType Directory -Force -Path $dstModels | Out-Null
-            Copy-Item -Path "$srcModels\*" -Destination $dstModels -Recurse -Force
-          }
-
-      - name: 7. 同步版本号并编译 Inno Setup 安装程序
-        if: ${{ github.event.inputs.build_target == 'installer' || github.event.inputs.build_target == 'all' }}
-        shell: pwsh
-        run: |
-          $verStr = "${{ env.APP_VERSION }}"
-          (Get-Content "installer.iss" -Raw) -replace '#define MyAppVersion ".*"', "#define MyAppVersion `"$verStr`"" | Set-Content "installer.iss" -NoNewline -Encoding UTF8
-          choco install innosetup -y
-          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { $iscc = "ISCC.exe" }
-          & $iscc "installer.iss"
-
-      - name: 8. 打包免安装文件夹为便携 ZIP
-        if: ${{ github.event.inputs.build_target == 'portable' || github.event.inputs.build_target == 'all' }}
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path "portable_out" | Out-Null
-          $zipPath = "portable_out\证件照批量换底色工具_Czq_免安装版_v${{ env.APP_VERSION }}.zip"
-          Compress-Archive -Path "dist\证件照批量换底色工具_Czq" -DestinationPath $zipPath -Force
-
-      - name: 9. 上传构建产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: 证件照批量换底色工具_Czq_v${{ env.APP_VERSION }}
-          path: |
-            output\*.exe
-            portable_out\*.zip
-          if-no-files-found: ignore
+            --version-
