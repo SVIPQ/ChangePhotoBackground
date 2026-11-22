@@ -14,7 +14,7 @@ on:
           - all
 
 env:
-  APP_VERSION: "4.0.0.0"
+  APP_VERSION: "4.0.0.1"
 
 permissions:
   contents: write
@@ -99,7 +99,7 @@ jobs:
       - name: 6. 使用 PyInstaller 打包免安装文件夹（含版本信息、元数据与默认离线模型）
         shell: pwsh
         run: |
-          $entryScript = if (Test-Path "证件照批量换底色_2.py") { "证件照批量换底色_2.py" } else { "证件照批量换底色.py" }
+          $entryScript = if (Test-Path "证件照批量换底色.py") { "证件照批量换底色.py" } else { "证件照批量换底色.py" }
           pyinstaller --noconfirm --clean --onedir --windowed `
             --name "证件照批量换底色工具_Czq" `
             --icon "app.ico" `
