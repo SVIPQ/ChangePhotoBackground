@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-证件照批量换底色工具_Czq
-- 单模型 BiRefNet 抠图后增加边缘背景估计与人体区域保护，降低浅色衣物/肩膀误删
-- 可选 OpenCV GrabCut 对疑似误删区域进行局部修复；未安装 OpenCV 时自动使用保守模式
-- 底部增加单张实时进度条、总进度条、数字百分比、单张步骤说明、批量总体进度与当前照片名称
-- 导入列表支持右键菜单：
-    * 重新生成（子菜单选 3 个单模型之一单独重算）
-    * 更改生成名称（仅改单张输出名，底部名称清单不动）
-    * 另存为...（单独指定单张导出目录）
-    * 复制图片（复制到剪贴板，优先已生成图，否则原图）
-    * 从列表移除
-    * 删除本地文件
-- 导出位置下方名称清单实时箭头映射 + 完成整行变绿与 ✔
+证件照批量去底色工具_CZQ.py
+融合特性：
+  1. 保留全图双模型模式：头部模型与服装模型分别处理完整照片，再按颈肩区域融合
+  2. 优化背景后处理：纯色背景 HSV 识别、逐行亮度估计、边界连通与发缝残余背景清除、
+     基于衣物主体的白肩/浅色衣块连通域找回、发丝去红溢色
+  3. 保留多模型/镜像下载/自定义 .onnx、右键菜单、名称清单实时映射、
+     双进度条与圆角白蓝 UI
+  4. 支持证件照常用尺寸（含自定义）、人脸自动裁剪、亮度/对比度调节、
+     渐变色背景、6 寸相纸自动排版
 """
 import gc
 import io
@@ -53,7 +50,7 @@ except Exception:
     HAS_DND = False
 
 APP_DISPLAY_NAME = "证件照批量换底色工具_Czq"
-SPLASH_DISPLAY_NAME = "证件照批量换底色工具_Czq"
+SPLASH_DISPLAY_NAME = ("证件照批量换底色工具_Czq")
 
 if sys.stdout is None:
     sys.stdout = io.StringIO()
@@ -62,6 +59,21 @@ if sys.stderr is None:
 
 MODEL_WEIGHT_EXTS = {".onnx", ".pth", ".pt", ".bin", ".safetensors"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+PHOTO_SIZES = [
+    ("保持原比例（不裁切）", 0, 0),
+    ("小一寸  22×32mm", 259, 377),
+    ("标准一寸  25×35mm", 295, 413),
+    ("大一寸  33×48mm", 390, 567),
+    ("小二寸  35×45mm", 413, 531),
+    ("标准二寸  35×49mm", 413, 579),
+    ("大二寸  40×60mm", 472, 709),
+    ("自定义尺寸", -1, -1),
+]
+
+PHOTO_PAPER_W = 1800
+PHOTO_PAPER_H = 1200
+PHOTO_PAPER_MARGIN = 16
 
 PRESETS = {
     "蓝色（常用）": "#438EDB",
@@ -119,6 +131,484 @@ THEME = {
     "ok_bg": "#DCFCE7",
     "err_red": "#DC2626",
 }
+
+
+class HairRedSpillModule:
+    """
+    发丝边缘去红、发缝背景清理与白色肩袖完整找回模块：
+    - 识别纯色原背景（含发丝包围的小块红底缝隙），避免右侧碎发残留红块；
+    - 从黑色/深色衣物前景主体出发，通过连通域生长完整找回贴在肩膀两侧的白色/浅色衣片；
+    - 在边缘做逐行背景反混合 + 发丝红溢色抑制，保持边缘自然柔和。
+    """
+
+    def __init__(
+        self,
+        red_excess_threshold: float = 11.0,
+        hair_luma_max: float = 125.0,
+        hair_blend_ratio: float = 0.82,
+        band_expand_ratio: float = 0.012,
+    ):
+        self.red_excess_threshold = float(red_excess_threshold)
+        self.hair_luma_max = float(hair_luma_max)
+        self.hair_blend_ratio = float(hair_blend_ratio)
+        self.band_expand_ratio = float(band_expand_ratio)
+
+    def _build_bg_array(self, h: int, w: int, bg_rgb, gradient: bool = False):
+        if not HAS_NUMPY:
+            return None
+        r, g, b = [float(x) for x in bg_rgb]
+        if not gradient:
+            return np.broadcast_to(np.asarray([r, g, b], dtype=np.float32).reshape(1, 1, 3), (h, w, 3)).copy()
+        ratio = np.linspace(0.0, 1.0, h, dtype=np.float32).reshape(h, 1, 1)
+        top = np.asarray([r, g, b], dtype=np.float32).reshape(1, 1, 3)
+        bottom = np.asarray([255.0, 255.0, 255.0], dtype=np.float32).reshape(1, 1, 3)
+        grad_col = top * (1.0 - ratio) + bottom * ratio
+        return np.broadcast_to(grad_col, (h, w, 3)).copy()
+
+    def _rescue_connected_white_shoulders(
+        self,
+        src_rgb: "np.ndarray",
+        alpha_2d: "np.ndarray",
+        bg_mask: "np.ndarray",
+        bg_sat: float,
+    ) -> "np.ndarray":
+        """
+        放宽衣物阈值并结合连通域生长，完整找回左侧与右侧的白色/浅色肩片与袖条，
+        防止左肩衣服边缘被过度裁切。
+        """
+        if not HAS_OPENCV:
+            return alpha_2d
+
+        # 若原图本身就是白底/浅灰底（低饱和度背景），不启用白衣连通扩张，防止把白背景吸入前景
+        if bg_sat < 55.0:
+            return alpha_2d
+
+        h, w = alpha_2d.shape[:2]
+        hsv = cv2.cvtColor(src_rgb, cv2.COLOR_RGB2HSV)
+        core = (alpha_2d > 80.0).astype(np.uint8)
+        if not np.any(core):
+            return alpha_2d
+
+        ys, _xs = np.where(core > 0)
+        top_y = int(np.min(ys))
+        bot_y = int(np.max(ys))
+        person_h = max(1, bot_y - top_y)
+        shoulder_top = max(int(h * 0.45), top_y + int(person_h * 0.44))
+        shoulder_top = min(shoulder_top, int(h * 0.72))
+
+        cloth_zone = np.zeros((h, w), dtype=bool)
+        cloth_zone[shoulder_top:h, :] = True
+
+        # 放宽白色/浅灰衣物阈值：高亮度 + 较宽饱和度容差 + 非原背景
+        bright_low_sat = (
+            (hsv[:, :, 2] >= 120) &
+            (hsv[:, :, 1] <= 145) &
+            (~bg_mask) &
+            cloth_zone
+        )
+        if not np.any(bright_low_sat):
+            return alpha_2d
+
+        bridge_k = max(11, int(min(w, h) * 0.022))
+        if bridge_k % 2 == 0:
+            bridge_k += 1
+        bridged_white = cv2.morphologyEx(
+            bright_low_sat.astype(np.uint8),
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bridge_k, bridge_k)),
+        ) > 0
+        bridged_white = bridged_white & cloth_zone & (~bg_mask)
+
+        seed_r = max(19, int(min(w, h) * 0.032))
+        if seed_r % 2 == 0:
+            seed_r += 1
+        body_core = core & cloth_zone
+        body_seed = cv2.dilate(
+            body_core,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (seed_r, seed_r)),
+            iterations=1,
+        ) > 0
+
+        num_labels, labels = cv2.connectedComponents(bridged_white.astype(np.uint8), connectivity=8)
+        if num_labels <= 1:
+            return alpha_2d
+
+        touched_labels = np.unique(labels[bridged_white & body_seed])
+        touched_labels = touched_labels[touched_labels != 0]
+        if touched_labels.size == 0:
+            return alpha_2d
+
+        connected_white = np.isin(labels, touched_labels) & (bright_low_sat | bridged_white)
+        if not np.any(connected_white):
+            return alpha_2d
+
+        v_conf = np.clip((hsv[:, :, 2].astype(np.float32) - 105.0) / 90.0, 0.0, 1.0)
+        s_conf = np.clip((165.0 - hsv[:, :, 1].astype(np.float32)) / 85.0, 0.0, 1.0)
+        rescue_alpha = 228.0 + 27.0 * np.minimum(v_conf, s_conf)
+        rescue_alpha = cv2.GaussianBlur(rescue_alpha * connected_white.astype(np.float32), (3, 3), 0)
+        return np.maximum(alpha_2d, rescue_alpha)
+
+    def process(self, im_rgba, alpha_img, bg_rgb, clean_edge: bool = True, gradient: bool = False):
+        src_rgb = np.asarray(im_rgba.convert("RGB"), dtype=np.uint8)
+        h, w = src_rgb.shape[:2]
+        alpha_2d = np.asarray(
+            alpha_img.resize((w, h), Image.Resampling.BILINEAR), dtype=np.float32
+        )
+        alpha_2d = np.clip(alpha_2d, 0.0, 255.0)
+
+        if not HAS_NUMPY:
+            bg_img = Image.new("RGB", (w, h), tuple(int(x) for x in bg_rgb))
+            return Image.composite(
+                im_rgba.convert("RGB"), bg_img,
+                alpha_img.resize((w, h), Image.Resampling.BILINEAR).convert("L")
+            )
+
+        patch = max(8, int(min(w, h) * 0.04))
+        top_samples = np.concatenate([
+            src_rgb[:patch, :patch].reshape(-1, 3),
+            src_rgb[:patch, -patch:].reshape(-1, 3),
+        ], axis=0)
+        fallback_bg = np.median(top_samples, axis=0).astype(np.float32)
+
+        bg_mask = np.zeros((h, w), dtype=bool)
+        bg_row = np.broadcast_to(fallback_bg[None, None, :], (h, 1, 3)).copy()
+        bg_sat = 0.0
+
+        if HAS_OPENCV:
+            hsv = cv2.cvtColor(src_rgb, cv2.COLOR_RGB2HSV)
+            top_hsv = np.concatenate([
+                hsv[:patch, :patch].reshape(-1, 3),
+                hsv[:patch, -patch:].reshape(-1, 3),
+            ], axis=0).astype(np.float32)
+
+            angles = top_hsv[:, 0] * (2.0 * np.pi / 180.0)
+            mean_sin = float(np.mean(np.sin(angles)))
+            mean_cos = float(np.mean(np.cos(angles)))
+            bg_hue = (
+                (np.arctan2(mean_sin, mean_cos) % (2.0 * np.pi))
+                * (180.0 / (2.0 * np.pi))
+            )
+            bg_sat = float(np.median(top_hsv[:, 1]))
+
+            if bg_sat >= 85.0:
+                hue = hsv[:, :, 0].astype(np.float32)
+                hue_diff = np.abs(hue - bg_hue)
+                hue_diff = np.minimum(hue_diff, 180.0 - hue_diff)
+                sat_floor = max(165.0, bg_sat * 0.80)
+                hue_sat_candidate = (
+                    (hue_diff <= 9.0) &
+                    (hsv[:, :, 1].astype(np.float32) >= sat_floor)
+                )
+
+                prelim_u8 = hue_sat_candidate.astype(np.uint8)
+                n0, labels0, _, _ = cv2.connectedComponentsWithStats(prelim_u8, connectivity=8)
+                preliminary_bg = np.zeros((h, w), dtype=bool)
+                if n0 > 1:
+                    edge_labels = np.unique(np.concatenate([
+                        labels0[0, :], labels0[-1, :], labels0[:, 0], labels0[:, -1]
+                    ]))
+                    edge_labels = edge_labels[edge_labels != 0]
+                    if edge_labels.size:
+                        preliminary_bg = np.isin(labels0, edge_labels)
+
+                row_rgb = np.full((h, 3), np.nan, dtype=np.float32)
+                row_value = np.full(h, np.nan, dtype=np.float32)
+                for yy in range(h):
+                    row_sel = preliminary_bg[yy]
+                    if int(np.count_nonzero(row_sel)) >= 4:
+                        row_rgb[yy] = np.median(src_rgb[yy][row_sel], axis=0).astype(np.float32)
+                        row_value[yy] = float(np.median(hsv[yy, :, 2][row_sel]))
+
+                valid_rows = np.where(np.isfinite(row_rgb[:, 0]))[0]
+                if valid_rows.size >= 2:
+                    all_rows = np.arange(h)
+                    for channel in range(3):
+                        row_rgb[:, channel] = np.interp(
+                            all_rows, valid_rows, row_rgb[valid_rows, channel]
+                        )
+                    row_value = np.interp(all_rows, valid_rows, row_value[valid_rows])
+                    row_rgb = cv2.GaussianBlur(
+                        row_rgb.reshape(h, 1, 3), (1, 31), 0
+                    ).reshape(h, 3)
+                    row_value = cv2.GaussianBlur(
+                        row_value.reshape(h, 1), (1, 31), 0
+                    ).reshape(h)
+                    bg_row = row_rgb.reshape(h, 1, 3)
+
+                    value_floor = np.maximum(45.0, row_value[:, None] * 0.70)
+                    refined_candidate = (
+                        hue_sat_candidate &
+                        (hsv[:, :, 2].astype(np.float32) >= value_floor)
+                    )
+                else:
+                    refined_candidate = hue_sat_candidate
+
+                n1, labels1, stats1, centroids1 = cv2.connectedComponentsWithStats(
+                    refined_candidate.astype(np.uint8), connectivity=8
+                )
+                keep_labels = np.zeros(n1, dtype=bool)
+                if n1 > 1:
+                    edge_labels = np.unique(np.concatenate([
+                        labels1[0, :], labels1[-1, :], labels1[:, 0], labels1[:, -1]
+                    ]))
+                    edge_labels = edge_labels[edge_labels != 0]
+                    keep_labels[edge_labels] = True
+
+                    src_f = src_rgb.astype(np.float32)
+                    row_bg_field = np.broadcast_to(bg_row, (h, w, 3))
+                    row_color_dist = np.sqrt(
+                        np.sum((src_f - row_bg_field) ** 2, axis=2)
+                    )
+                    min_component_area = max(90, int(w * h * 0.00006))
+                    for label_id in range(1, n1):
+                        if keep_labels[label_id]:
+                            continue
+                        area = int(stats1[label_id, cv2.CC_STAT_AREA])
+                        if area < min_component_area:
+                            continue
+                        cx, cy = centroids1[label_id]
+                        is_outer_or_hair = (cx < w * 0.34) or (cx > w * 0.66) or (cy < h * 0.25)
+                        if not is_outer_or_hair:
+                            continue
+                        component = (labels1 == label_id)
+                        if float(np.median(row_color_dist[component])) < 45.0:
+                            keep_labels[label_id] = True
+
+                    bg_mask = keep_labels[labels1]
+
+        if np.any(bg_mask):
+            alpha_2d[bg_mask] = 0.0
+
+        alpha_2d = self._rescue_connected_white_shoulders(
+            src_rgb=src_rgb,
+            alpha_2d=alpha_2d,
+            bg_mask=bg_mask,
+            bg_sat=bg_sat,
+        )
+
+        if clean_edge and HAS_OPENCV and np.any(bg_mask):
+            edge_radius = max(7, int(min(w, h) * 0.011))
+            if edge_radius % 2 == 0:
+                edge_radius += 1
+            near_background = cv2.dilate(
+                bg_mask.astype(np.uint8),
+                cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (edge_radius, edge_radius)
+                ),
+                iterations=1,
+            ) > 0
+
+            a = np.clip(alpha_2d / 255.0, 0.0, 1.0)
+            edge_pixels = near_background & (a >= 0.06) & (a <= 0.99)
+            if np.any(edge_pixels):
+                bg_field = np.broadcast_to(bg_row, (h, w, 3)).astype(np.float32)
+                src_f = src_rgb.astype(np.float32)
+                denom = np.maximum(a[:, :, None], 0.25)
+                recovered_fg = (
+                    src_f - (1.0 - a[:, :, None]) * bg_field
+                ) / denom
+                recovered_fg = np.clip(recovered_fg, 0.0, 255.0)
+
+                bg_dist = np.sqrt(
+                    np.sum((src_f - bg_field) ** 2, axis=2)
+                )
+                spill_conf = np.clip((175.0 - bg_dist) / 110.0, 0.0, 1.0)
+                alpha_conf = np.clip((1.0 - a) / 0.72, 0.0, 1.0)
+                strength = (spill_conf * alpha_conf * 0.85)[:, :, None]
+                corrected = src_f * (1.0 - strength) + recovered_fg * strength
+
+                # 精细压制发丝边缘的红通道溢色（仅作用于背景邻接边缘带，不影响脸部/眉毛/眼镜）
+                r_ch = corrected[:, :, 0]
+                g_ch = corrected[:, :, 1]
+                b_ch = corrected[:, :, 2]
+                gb_max = np.maximum(g_ch, b_ch)
+                gb_mean = 0.5 * (g_ch + b_ch)
+                excess_red = r_ch - gb_max
+                red_eff_thresh = max(8.0, self.red_excess_threshold * 0.75)
+                red_spill = edge_pixels & (a < 0.96) & (excess_red > red_eff_thresh)
+                if np.any(red_spill):
+                    target_r = gb_mean + red_eff_thresh + (excess_red - red_eff_thresh) * 0.12
+                    corrected[:, :, 0] = np.where(red_spill, np.minimum(r_ch, target_r), r_ch)
+
+                src_rgb = np.where(
+                    edge_pixels[:, :, None],
+                    np.clip(corrected, 0, 255),
+                    src_f,
+                ).astype(np.uint8)
+
+        bg_arr = self._build_bg_array(h, w, bg_rgb, gradient=gradient)
+        a_norm = np.clip(alpha_2d / 255.0, 0.0, 1.0)[:, :, None]
+        out = src_rgb.astype(np.float32) * a_norm + bg_arr * (1.0 - a_norm)
+        return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="RGB")
+
+
+def apply_brightness_contrast_pil(img, brightness: int = 0, contrast: int = 0):
+    if brightness == 0 and contrast == 0:
+        return img
+    if HAS_NUMPY and HAS_OPENCV:
+        arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+        bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        beta = brightness * 2.55
+        alpha = 1.0 + contrast / 100.0
+        adjusted = cv2.convertScaleAbs(bgr, alpha=alpha, beta=beta)
+        rgb = cv2.cvtColor(adjusted, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb, mode="RGB")
+    from PIL import ImageEnhance
+    out = img.convert("RGB")
+    if brightness != 0:
+        out = ImageEnhance.Brightness(out).enhance(max(0.1, 1.0 + brightness / 100.0))
+    if contrast != 0:
+        out = ImageEnhance.Contrast(out).enhance(max(0.1, 1.0 + contrast / 100.0))
+    return out
+
+
+_FACE_CASCADE = None
+
+
+def _get_face_cascade():
+    global _FACE_CASCADE
+    if _FACE_CASCADE is not None:
+        return _FACE_CASCADE
+    if not HAS_OPENCV:
+        return None
+    try:
+        xml_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        if os.path.exists(xml_path):
+            _FACE_CASCADE = cv2.CascadeClassifier(xml_path)
+    except Exception:
+        _FACE_CASCADE = None
+    return _FACE_CASCADE
+
+
+def estimate_neck_split_y(im_rgba, offset_ratio: float = 0.0) -> int:
+    w, h = im_rgba.size
+    split_y = int(h * 0.56)
+    if HAS_NUMPY and HAS_OPENCV:
+        try:
+            cascade = _get_face_cascade()
+            if cascade is not None:
+                rgb = np.asarray(im_rgba.convert("RGB"), dtype=np.uint8)
+                gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+                min_side = max(36, int(min(w, h) * 0.12))
+                faces = cascade.detectMultiScale(
+                    gray,
+                    scaleFactor=1.1,
+                    minNeighbors=5,
+                    minSize=(min_side, min_side),
+                )
+                if len(faces) > 0:
+                    _fx, fy, _fw, fh = max(faces, key=lambda b: b[2] * b[3])
+                    split_y = int(fy + fh * 1.28)
+        except Exception:
+            pass
+
+    split_y += int(h * float(offset_ratio))
+    min_y = max(32, int(h * 0.30))
+    max_y = max(min_y + 20, int(h * 0.85))
+    return max(min_y, min(max_y, split_y))
+
+
+def detect_ort_providers(prefer_gpu: bool = True) -> tuple[list[str], str]:
+    avail = []
+    try:
+        import onnxruntime as ort
+        avail = list(ort.get_available_providers() or [])
+    except Exception:
+        avail = []
+
+    if not prefer_gpu:
+        return (["CPUExecutionProvider"], "CPU 模式（已手动切换）")
+
+    if "CUDAExecutionProvider" in avail:
+        return (["CUDAExecutionProvider", "CPUExecutionProvider"], "NVIDIA GPU (CUDA)")
+    if "DmlExecutionProvider" in avail:
+        return (["DmlExecutionProvider", "CPUExecutionProvider"], "GPU 加速 (DirectML)")
+    return (["CPUExecutionProvider"], "CPU 模式（未检测到 GPU 加速包）")
+
+
+def fit_photo_size_pil(img, target_w: int, target_h: int, auto_crop: bool = True):
+    if target_w <= 0 or target_h <= 0:
+        return img
+    w, h = img.size
+    if w <= 1 or h <= 1:
+        return img
+
+    aspect = target_w / target_h
+    cropped = img
+
+    if auto_crop and HAS_NUMPY and HAS_OPENCV:
+        cascade = _get_face_cascade()
+        gray = cv2.cvtColor(np.asarray(img.convert("RGB"), dtype=np.uint8), cv2.COLOR_RGB2GRAY)
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)) if cascade is not None else ()
+        if len(faces) > 0:
+            fx, fy, fw, fh = max(faces, key=lambda b: b[2] * b[3])
+            top = max(0, int(fy - fh * 0.35))
+            bottom = min(h, int(fy + fh * 1.60))
+            crop_h = max(1, bottom - top)
+            crop_w = int(crop_h * aspect)
+            if crop_w > w:
+                crop_w = w
+                crop_h = max(1, int(crop_w / aspect))
+                bottom = min(h, top + crop_h)
+                top = max(0, bottom - crop_h)
+                crop_h = bottom - top
+            cx = int(fx + fw / 2)
+            left = max(0, min(w - crop_w, cx - crop_w // 2))
+            cropped = img.crop((left, top, left + crop_w, top + crop_h))
+        else:
+            cur_ratio = w / h
+            if cur_ratio > aspect:
+                new_w = int(h * aspect)
+                left = (w - new_w) // 2
+                cropped = img.crop((left, 0, left + new_w, h))
+            else:
+                new_h = int(w / aspect)
+                top = (h - new_h) // 2
+                cropped = img.crop((0, top, w, top + new_h))
+    else:
+        cur_ratio = w / h
+        if cur_ratio > aspect:
+            new_w = int(h * aspect)
+            left = (w - new_w) // 2
+            cropped = img.crop((left, 0, left + new_w, h))
+        else:
+            new_h = int(w / aspect)
+            top = (h - new_h) // 2
+            cropped = img.crop((0, top, w, top + new_h))
+
+    return cropped.resize((int(target_w), int(target_h)), Image.Resampling.LANCZOS)
+
+
+def calc_6in_layout(photo_w: int, photo_h: int):
+    pw = max(1, int(photo_w))
+    ph = max(1, int(photo_h))
+    avail_w = max(pw, PHOTO_PAPER_W - PHOTO_PAPER_MARGIN * 2)
+    avail_h = max(ph, PHOTO_PAPER_H - PHOTO_PAPER_MARGIN * 2)
+    cols = max(1, avail_w // pw)
+    rows = max(1, avail_h // ph)
+    total = cols * rows
+    names = {
+        1: "一", 2: "二", 3: "三", 4: "四", 6: "六",
+        8: "八", 9: "九", 10: "十", 12: "十二", 16: "十六", 18: "十八",
+    }
+    label = f"{names.get(total, total)}分身（{cols}×{rows}）"
+    return cols, rows, label
+
+
+def create_6in_layout_pil(single_img):
+    single_rgb = single_img.convert("RGB")
+    w, h = single_rgb.size
+    cols, rows, _ = calc_6in_layout(w, h)
+    margin_x = max(4, (PHOTO_PAPER_W - cols * w) // (cols + 1))
+    margin_y = max(4, (PHOTO_PAPER_H - rows * h) // (rows + 1))
+    canvas = Image.new("RGB", (PHOTO_PAPER_W, PHOTO_PAPER_H), (255, 255, 255))
+    for r_idx in range(rows):
+        for c_idx in range(cols):
+            x1 = margin_x + c_idx * (w + margin_x)
+            y1 = margin_y + r_idx * (h + margin_y)
+            if x1 + w <= PHOTO_PAPER_W and y1 + h <= PHOTO_PAPER_H:
+                canvas.paste(single_rgb, (x1, y1))
+    return canvas
 
 
 def format_model_label(model_name: str) -> str:
@@ -315,7 +805,7 @@ def sanitize_stem_name(raw_name: str) -> str:
     s_no_ext = re.sub(r"\.(jpg|jpeg|png|bmp|webp|tif|tiff)$", "", s, flags=re.IGNORECASE).strip()
     if not s_no_ext:
         s_no_ext = s
-    return re.sub(r'[\\/:*?"<>|]+', "_", s_no_ext).strip(" .")
+    return re.sub(r'[\/:*?"<>|]+', "_", s_no_ext).strip(" .")
 
 
 def parse_name_lines(raw_text: str) -> list[str]:
@@ -352,8 +842,10 @@ def compute_target_output_path(
     ext: str,
     custom_stem: str | None = None,
     override_dir: Path | None = None,
+    layout_6in: bool = False,
 ) -> tuple[Path, Path]:
-    stem_to_use = custom_stem if custom_stem else src.stem
+    base_stem = custom_stem if custom_stem else src.stem
+    stem_to_use = f"{base_stem}_6寸排版" if layout_6in else base_stem
     if override_dir is not None:
         out_folder = override_dir
         target = out_folder / (stem_to_use + ext)
@@ -415,7 +907,6 @@ def encode_image_output(image, fmt, limit_enabled: bool, max_kb: int):
 
 
 def copy_image_to_clipboard(img_path: Path):
-    """将图片文件或位图写入 Windows 剪贴板"""
     resolved = str(img_path.resolve()).replace("'", "''")
     ps_cmd = (
         f"$p = '{resolved}'; "
@@ -467,24 +958,24 @@ class SoftPillCard:
     def __init__(
         self,
         parent,
-        radius=22,
+        radius=18,
         bg_color="#FFFFFF",
         border_color="#D8E4F3",
         parent_bg="#F1F6FD",
-        padx=16,
-        pady=8,
-        outer_pady=(0, 6),
+        padx=14,
+        pady=4,
+        outer_pady=(0, 3),
     ):
         self.pill_r = float(radius)
         self.bg_color = bg_color
         self.border_color = border_color
         self.card_w = 580.0
-        self.card_h = 85.0
+        self.card_h = 70.0
 
         self.canvas = tk.Canvas(
             parent,
             width=580,
-            height=85,
+            height=70,
             bg=parent_bg,
             highlightthickness=0,
             bd=0,
@@ -497,7 +988,7 @@ class SoftPillCard:
             pady,
             window=self.inner,
             anchor="nw",
-            width=548,
+            width=584,
         )
         self.padx = padx
         self.pady = pady
@@ -513,7 +1004,7 @@ class SoftPillCard:
             self._redraw()
 
     def _on_inner_resize(self, event):
-        if event.height > 10:
+        if event.height > 8:
             needed_h = float(event.height + self.pady * 2)
             if abs(needed_h - self.card_h) > 1.0:
                 self.card_h = needed_h
@@ -545,13 +1036,13 @@ class SoftPillField:
     def __init__(
         self,
         parent,
-        height=28,
-        radius=14,
+        height=32,
+        radius=16,
         bg_color="#F8FAFC",
         border_color="#CBD5E1",
         parent_bg="#FFFFFF",
         padx=10,
-        pady=3,
+        pady=2,
     ):
         self.pill_r = float(radius)
         self.bg_color = bg_color
@@ -617,7 +1108,7 @@ class SoftPillProgressBar(tk.Canvas):
     def __init__(
         self,
         parent,
-        height=12,
+        height=10,
         track_color="#DCEAFF",
         fill_color="#2563EB",
         parent_bg="#F1F6FD",
@@ -682,8 +1173,8 @@ class SoftPillButton(tk.Canvas):
         text,
         command=None,
         width=112,
-        height=28,
-        radius=14,
+        height=32,
+        radius=16,
         bg_color="#EBF3FF",
         hover_color="#DCEAFF",
         fg_color="#1E3A8A",
@@ -836,8 +1327,8 @@ class SoftPillBanner(tk.Canvas):
         self,
         parent,
         main_text,
-        height=40,
-        radius=20,
+        height=36,
+        radius=18,
         bg_color="#EFF6FF",
         hover_color="#DBEAFE",
         border_color="#93C5FD",
@@ -1014,13 +1505,46 @@ class LoadingWindow:
             pass
 
 
+def _get_workarea_bounds(win):
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    left, top, right, bottom = 0, 0, sw, sh
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", wintypes.LONG),
+                    ("top", wintypes.LONG),
+                    ("right", wintypes.LONG),
+                    ("bottom", wintypes.LONG),
+                ]
+
+            rect = RECT()
+            SPI_GETWORKAREA = 0x0030
+            if ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+                if rect.right > rect.left and rect.bottom > rect.top:
+                    left, top, right, bottom = int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+        except Exception:
+            pass
+    return left, top, right, bottom
+
+
 def center_window_on_screen(win, width: int, height: int):
     win.update_idletasks()
     sw = win.winfo_screenwidth()
-    sh = win.winfo_screenheight()
-    x = max(0, (sw - width) // 2)
-    y = max(0, (sh - height) // 2)
-    win.geometry(f"{width}x{height}+{x}+{y}")
+    left, top, right, bottom = _get_workarea_bounds(win)
+    work_w = max(320, right - left)
+    work_h = max(320, bottom - top)
+    fit_w = min(int(width), work_w)
+    fit_h = min(int(height), work_h - 6)
+    fit_h = max(320, fit_h)
+    x = left + max(0, (work_w - fit_w) // 2)
+    # Place above taskbar/status area, slightly above vertical center
+    y = top + max(0, min(work_h - fit_h - 4, int((work_h - fit_h) * 0.25)))
+    win.geometry(f"{fit_w}x{fit_h}+{x}+{y}")
 
 
 class App:
@@ -1029,22 +1553,29 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_DISPLAY_NAME)
-        win_w, win_h = 630, 955
-        self.root.minsize(590, 885)
+        win_w, win_h = 740, 910
+        self.root.minsize(710, 780)
         self.root.configure(bg=THEME["bg"])
         center_window_on_screen(self.root, win_w, win_h)
 
         default_output_path = str(Path.home() / "Desktop")
         default_threads = 1
 
+        self.hair_spill_module = HairRedSpillModule(
+            red_excess_threshold=11.0,
+            hair_luma_max=125.0,
+            hair_blend_ratio=0.82,
+            band_expand_ratio=0.012,
+        )
+
         self.msgq = queue.Queue()
         self.input_paths = []
         self._images = []
         self._img_index_map = {}
         self._img_states = {}
-        self._custom_stems = {}       # key -> 单独指定的输出文件名（不含后缀），不动底部名称清单
-        self._custom_out_dirs = {}     # key -> 单独指定的另存为目录 Path
-        self._last_output_files = {}   # key -> 最近一次生成的输出文件路径 Path
+        self._custom_stems = {}
+        self._custom_out_dirs = {}
+        self._last_output_files = {}
         self._name_lines = []
         self._is_downloading_model = False
         self._is_running = False
@@ -1053,17 +1584,30 @@ class App:
         self._name_sync_job = None
 
         self.output_dir = tk.StringVar(value=default_output_path)
-        self.mode_choice = tk.StringVar(value="single")
+        self.mode_choice = tk.StringVar(value="split")
         self.single_model = tk.StringVar(value=DEFAULT_MODEL)
+        self.head_model = tk.StringVar(value="birefnet-portrait")
+        self.body_model = tk.StringVar(value="isnet-general-use")
+        self.neck_offset_pct = tk.IntVar(value=0)
         self.use_custom_model_path = tk.BooleanVar(value=False)
         self.custom_model_file = tk.StringVar(value="")
         self.ensemble_choice = tk.StringVar(value="双模型叠加 (birefnet + isnet)")
+
+        self.size_choice = tk.StringVar(value=PHOTO_SIZES[0][0])
+        self.custom_w = tk.IntVar(value=295)
+        self.custom_h = tk.IntVar(value=413)
+        self.auto_crop = tk.BooleanVar(value=False)
+        self.brightness_val = tk.IntVar(value=0)
+        self.contrast_val = tk.IntVar(value=0)
+        self.gradient_bg = tk.BooleanVar(value=False)
+        self.layout_6in = tk.BooleanVar(value=False)
 
         self.fine_edge = tk.BooleanVar(value=True)
         self.color = tk.StringVar(value=PRESETS["蓝色（常用）"])
         self.output_format = tk.StringVar(value="JPG")
         self.limit_size_enabled = tk.BooleanVar(value=True)
         self.max_kb = tk.IntVar(value=50)
+        self.use_gpu = tk.BooleanVar(value=True)
         self.thread_count = tk.IntVar(value=default_threads)
         self.status = tk.StringVar(value="拖入文件夹确认后，再点击下方“开始批量处理”")
         self.overall_status = tk.StringVar(value="总体进度：0%（已完成 0/0 张） | 当前照片：无")
@@ -1079,6 +1623,8 @@ class App:
             messagebox.showerror("界面构建错误", traceback.format_exc())
         self._sync_mode_panels()
         self._sync_size_limit_state()
+        self._sync_size_custom_state()
+        self.root.after(40, self._fit_window_to_content_and_screen)
         self._poll()
 
     def on_close(self):
@@ -1110,20 +1656,20 @@ class App:
         except Exception:
             pass
 
-    def _make_pill_card(self, parent, radius=22, outer_pady=(0, 6)):
+    def _make_pill_card(self, parent, radius=20, outer_pady=(0, 6)):
         card = SoftPillCard(
             parent,
             radius=radius,
             bg_color=THEME["card"],
             border_color=THEME["border"],
             parent_bg=THEME["bg"],
-            padx=16,
+            padx=18,
             pady=8,
             outer_pady=outer_pady,
         )
         return card.canvas, card.inner
 
-    def _make_sec_btn(self, parent, text, command, width=112, height=28):
+    def _make_sec_btn(self, parent, text, command, width=112, height=24):
         return SoftPillButton(
             parent,
             text=text,
@@ -1135,7 +1681,7 @@ class App:
             hover_color=THEME["btn_sec_hover"],
             fg_color=THEME["btn_sec_fg"],
             wave_color="#93C5FD",
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=("Microsoft YaHei UI", 8, "bold"),
             parent_bg=THEME["card"],
         )
 
@@ -1154,6 +1700,8 @@ class App:
         ext = self._current_ext()
         key = str(src.resolve())
         stem = self._effective_stem(idx, src)
+        if bool(self.layout_6in.get()):
+            stem = f"{stem}_6寸排版"
         tag_parts = []
         if key in self._custom_stems and self._custom_stems[key]:
             tag_parts.append("单独改名")
@@ -1282,7 +1830,47 @@ class App:
         overall_pct = int(round(self._calc_overall_pct(finished_count, total_count, active_pct)))
         return f"总体进度：{overall_pct}%（已完成 {finished_count}/{total_count} 张） | 当前照片：{current_photo}"
 
-    # ---------- 列表右键菜单及单项操作 ----------
+    def _get_target_dimensions(self) -> tuple[int, int]:
+        label = self.size_choice.get()
+        for name, w, h in PHOTO_SIZES:
+            if name == label:
+                if w == -1 and h == -1:
+                    return max(10, int(self.custom_w.get())), max(10, int(self.custom_h.get()))
+                return w, h
+        return 0, 0
+
+    def _refresh_gpu_hint(self):
+        if not hasattr(self, "gpu_status_lbl"):
+            return
+        _provs, desc = detect_ort_providers(bool(self.use_gpu.get()))
+        is_gpu = ("GPU" in desc) or ("CUDA" in desc)
+        self.gpu_status_lbl.configure(
+            text=f"[{desc}]",
+            fg=THEME["ok_green"] if is_gpu else THEME["muted"],
+        )
+
+    def _snapshot_process_params(self):
+        tw, th = self._get_target_dimensions()
+        provs, gpu_desc = detect_ort_providers(bool(self.use_gpu.get()))
+        return {
+            "mode_choice": self.mode_choice.get(),
+            "ort_providers": provs,
+            "gpu_desc": gpu_desc,
+            "neck_offset_ratio": float(self.neck_offset_pct.get()) / 100.0,
+            "target_w": tw,
+            "target_h": th,
+            "auto_crop": bool(self.auto_crop.get()),
+            "brightness": int(self.brightness_val.get()),
+            "contrast": int(self.contrast_val.get()),
+            "gradient_bg": bool(self.gradient_bg.get()),
+            "layout_6in": bool(self.layout_6in.get()),
+            "fine_edge": bool(self.fine_edge.get()),
+            "fmt": (self.output_format.get() or "JPG").upper(),
+            "ext": self._current_ext(),
+            "limit_enabled": bool(self.limit_size_enabled.get()),
+            "max_kb": int(self.max_kb.get()),
+        }
+
     def _on_listbox_right_click(self, event):
         if self._is_running or self._is_downloading_model:
             return
@@ -1333,7 +1921,7 @@ class App:
         current_stem = self._effective_stem(idx, src)
         new_raw = simpledialog.askstring(
             "更改生成名称",
-            f"原图：{src.name}\n请输入单独生成的名称（底部名称清单不会改动）：",
+            f"原图：{src.name}请输入单独生成的名称（底部名称清单不会改动）：",
             initialvalue=current_stem,
             parent=self.root,
         )
@@ -1391,7 +1979,7 @@ class App:
             kind_label = "已生成图片" if target_to_copy == out_p else "原图"
             self.status.set(f"已复制{kind_label}到剪贴板：{target_to_copy.name}")
         except Exception as e:
-            messagebox.showerror("复制失败", f"无法复制到剪贴板：\n{e}")
+            messagebox.showerror("复制失败", f"无法复制到剪贴板：{e}")
 
     def _remove_from_list(self, idx: int):
         if idx < 0 or idx >= len(self._images):
@@ -1416,7 +2004,7 @@ class App:
             lines.append(f"已生成文件：{out_p}")
         confirm = messagebox.askyesno(
             "删除本地文件",
-            "确定要从硬盘删除以下本地文件吗？删除后无法恢复！\n\n" + "\n".join(lines),
+            "确定要从硬盘删除以下本地文件吗？删除后无法恢复！" + "".join(lines),
             parent=self.root,
         )
         if not confirm:
@@ -1429,7 +2017,7 @@ class App:
             self._remove_from_list(idx)
             self.status.set(f"已删除本地文件：{src.name}")
         except Exception as e:
-            messagebox.showerror("删除失败", f"删除文件时出错：\n{e}")
+            messagebox.showerror("删除失败", f"删除文件时出错：{e}")
 
     def _regen_single_with_model(self, idx: int, model_name: str):
         if self._is_running or self._is_downloading_model:
@@ -1439,7 +2027,7 @@ class App:
         if not is_model_ready(model_name):
             messagebox.showwarning(
                 "模型未就绪",
-                f"模型 [{model_name}] 尚未下载。\n请先在上方“抠图模型”中选择该模型并点击“下载模型”。",
+                f"模型 [{model_name}] 尚未下载。请先在上方“抠图模型”中选择该模型并点击“下载模型”。",
             )
             return
 
@@ -1464,11 +2052,8 @@ class App:
             messagebox.showerror("颜色设置错误", str(e))
             return
 
-        ext = self._current_ext()
-        fmt = (self.output_format.get() or "JPG").upper()
-        fine_edge = bool(self.fine_edge.get())
-        limit_enabled = bool(self.limit_size_enabled.get())
-        max_kb_val = int(self.max_kb.get())
+        params = self._snapshot_process_params()
+        params["mode_choice"] = "single"
         input_paths_snapshot = list(self.input_paths)
         model_label = format_model_label(model_name)
 
@@ -1492,7 +2077,7 @@ class App:
                     f"总体进度：10%（已完成 0/1 张） | 当前照片：{src.name}",
                     10.0,
                 ))
-                sess = new_session(model_name)
+                sess = self._create_session_with_providers(model_name, providers=params.get("ort_providers"))
                 out_folder, out_fname = self._process_single_image(
                     src=src,
                     c_stem=c_stem,
@@ -1500,11 +2085,7 @@ class App:
                     weighted_sessions=[(model_name, 1.0, sess)],
                     base_out=base_out,
                     rgb=rgb,
-                    fmt=fmt,
-                    limit_enabled=limit_enabled,
-                    max_kb=max_kb_val,
-                    fine_edge=fine_edge,
-                    ext=ext,
+                    params=params,
                     override_dir=out_dir_override,
                     step_cb=lambda pct, desc: self.msgq.put((
                         "step_progress",
@@ -1530,7 +2111,6 @@ class App:
 
         threading.Thread(target=_single_worker, daemon=True).start()
 
-    # ---------- 拖入与列表管理 ----------
     def _parse_dnd_paths(self, raw_data):
         if not raw_data:
             return []
@@ -1602,7 +2182,7 @@ class App:
 
             confirmed = messagebox.askyesno(
                 "确认导入",
-                f"检测到拖入：{preview_names}\n共扫描到 {len(candidate_images)} 张待处理图片。\n\n是否确认加入列表？（加入后需手动点击“开始批量处理”）",
+                f"检测到拖入：{preview_names}共扫描到 {len(candidate_images)} 张待处理图片。是否确认加入列表？（加入后需手动点击“开始批量处理”）",
             )
             if not confirmed:
                 self.input_paths = prev_paths
@@ -1646,18 +2226,20 @@ class App:
 
     def _build(self):
         header = tk.Frame(self.root, bg=THEME["bg"])
-        header.pack(fill="x", padx=14, pady=(8, 2))
+        header.pack(fill="x", padx=14, pady=(4, 1))
         tk.Label(
             header,
             text=APP_DISPLAY_NAME,
             bg=THEME["bg"],
             fg=THEME["text"],
-            font=("Microsoft YaHei UI", 14, "bold"),
+            font=("Microsoft YaHei UI", 12, "bold"),
         ).pack(anchor="w")
-        tk.Frame(header, height=4, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
 
-        # 卡片 1：导入列表
-        import_outer, import_card = self._make_pill_card(self.root, radius=22)
+        main_stack = tk.Frame(self.root, bg=THEME["bg"])
+        main_stack.pack(side="top", fill="both", expand=False)
+
+        # 1. 导入区域
+        import_outer, import_card = self._make_pill_card(main_stack, radius=20, outer_pady=(0, 3))
 
         main_hint = (
             "将文件夹或图片拖入此处；列表项支持右键重新生成/改名/另存/复制"
@@ -1675,28 +2257,28 @@ class App:
             main_fg=THEME["drop_fg"],
             parent_bg=THEME["card"],
         )
-        drop_banner.pack(fill="x", pady=(0, 6))
+        drop_banner.pack(fill="x", padx=0, pady=(2, 7))
 
         btn_row = tk.Frame(import_card, bg=THEME["card"])
         btn_row.pack(fill="x", pady=(0, 6))
-        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=106, height=28).pack(side="left", padx=(0, 8))
-        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=114, height=28).pack(side="left")
-        self._make_sec_btn(btn_row, "清空", self.clear, width=92, height=28).pack(side="right")
+        self._make_sec_btn(btn_row, "添加照片", self.add_files, width=102, height=23).pack(side="left", padx=(0, 8))
+        self._make_sec_btn(btn_row, "添加文件夹", self.add_folder, width=110, height=23).pack(side="left")
+        self._make_sec_btn(btn_row, "清空", self.clear, width=88, height=23).pack(side="right")
 
         list_pill = SoftPillField(
             import_card,
-            height=104,
+            height=112,
             radius=16,
             bg_color=THEME["list_bg"],
             border_color=THEME["border"],
             parent_bg=THEME["card"],
-            padx=12,
-            pady=4,
+            padx=10,
+            pady=2,
         )
         list_pill.canvas.pack(fill="x")
         self.listbox = tk.Listbox(
             list_pill.inner,
-            height=4,
+            height=2,
             bg=THEME["list_bg"],
             fg=THEME["text"],
             selectbackground=THEME["accent"],
@@ -1704,28 +2286,40 @@ class App:
             relief="flat",
             borderwidth=0,
             highlightthickness=0,
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 8),
         )
         self.listbox.pack(fill="both", expand=True)
         self.listbox.bind("<Button-3>", self._on_listbox_right_click)
 
         self._enable_full_drop_zone(import_outer, drop_banner)
 
-        # 卡片 2：处理参数与模型设置
-        _, set_card = self._make_pill_card(self.root, radius=22)
+        # 2. 处理参数与模型设置
+        _, set_card = self._make_pill_card(main_stack, radius=20, outer_pady=(0, 3))
         tk.Label(
             set_card,
             text="处理参数与模型设置",
             bg=THEME["card"],
             fg=THEME["text"],
             font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(anchor="w", pady=(0, 4))
+        ).pack(anchor="w", pady=(0, 2))
 
         r_mode = tk.Frame(set_card, bg=THEME["card"])
-        r_mode.pack(fill="x", pady=(0, 4))
+        r_mode.pack(fill="x", pady=(2, 5))
         tk.Radiobutton(
             r_mode,
-            text="抠图模型（建议使用 BiRefNet Portrait）",
+            text="上下分区双模型（发丝+衣边精修）",
+            variable=self.mode_choice,
+            value="split",
+            command=self._sync_mode_panels,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            selectcolor="#EFF6FF",
+            activebackground=THEME["card"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(side="left", padx=(0, 12))
+        tk.Radiobutton(
+            r_mode,
+            text="单模型全图抠图",
             variable=self.mode_choice,
             value="single",
             command=self._sync_mode_panels,
@@ -1733,13 +2327,13 @@ class App:
             fg=THEME["text"],
             selectcolor="#EFF6FF",
             activebackground=THEME["card"],
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(side="left", padx=(0, 18))
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(side="left")
 
         self.single_container = tk.Frame(set_card, bg=THEME["card"])
 
         r_models = tk.Frame(self.single_container, bg=THEME["card"])
-        r_models.pack(fill="x", pady=(0, 4))
+        r_models.pack(fill="x", pady=(0, 2))
 
         models_left = tk.Frame(r_models, bg=THEME["card"])
         models_left.pack(side="left", fill="x", expand=True)
@@ -1767,19 +2361,19 @@ class App:
             fg=THEME["muted"],
             font=("Microsoft YaHei UI", 8, "bold"),
         )
-        self.model_state_lbl.pack(anchor="w", padx=(10, 0), pady=(1, 0))
+        self.model_state_lbl.pack(anchor="w", padx=(10, 0))
 
         self.download_model_btn = self._make_sec_btn(
             r_models,
             "下载模型",
             self.download_selected_model_ui,
             width=self.RIGHT_BTN_W,
-            height=28,
+            height=23,
         )
         self.download_model_btn.pack(side="right", anchor="n")
 
         r_custom_chk = tk.Frame(self.single_container, bg=THEME["card"])
-        r_custom_chk.pack(fill="x", pady=(2, 2))
+        r_custom_chk.pack(fill="x", pady=(0, 1))
         tk.Checkbutton(
             r_custom_chk,
             text="自定义路径（指定电脑中其他位置的 .onnx 模型文件）",
@@ -1789,20 +2383,20 @@ class App:
             fg=THEME["text"],
             selectcolor="#EFF6FF",
             activebackground=THEME["card"],
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 8),
         ).pack(anchor="w", padx=(6, 0))
 
         r_custom_path = tk.Frame(self.single_container, bg=THEME["card"])
-        r_custom_path.pack(fill="x", pady=(0, 4))
+        r_custom_path.pack(fill="x", pady=(0, 2))
         custom_pill = SoftPillField(
             r_custom_path,
-            height=28,
-            radius=14,
+            height=24,
+            radius=12,
             bg_color="#F8FAFC",
             border_color="#CBD5E1",
             parent_bg=THEME["card"],
             padx=10,
-            pady=3,
+            pady=2,
         )
         custom_pill.canvas.pack(side="left", fill="x", expand=True, padx=(10, 8))
         self.custom_path_entry = tk.Entry(
@@ -1822,7 +2416,7 @@ class App:
             "选择 .onnx",
             self.choose_custom_onnx_file,
             width=self.RIGHT_BTN_W,
-            height=28,
+            height=23,
         )
         self.pick_onnx_btn.pack(side="right")
 
@@ -1832,7 +2426,7 @@ class App:
             text="叠加方案：",
             bg=THEME["card"],
             fg=THEME["text"],
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 8),
         ).pack(side="left", padx=(8, 6))
         self.ensemble_combo = ttk.Combobox(
             self.ensemble_container,
@@ -1840,35 +2434,185 @@ class App:
             values=list(ENSEMBLE_PRESETS.keys()),
             state="readonly",
             width=36,
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 8),
         )
         self.ensemble_combo.pack(side="left")
+
+        self.split_container = tk.Frame(set_card, bg=THEME["card"])
+
+        r_split_top = tk.Frame(self.split_container, bg=THEME["card"])
+        r_split_top.pack(fill="x", pady=(0, 2))
+        tk.Label(
+            r_split_top,
+            text="脖子以上(发丝/头部)：",
+            bg=THEME["card"],
+            fg=THEME["text"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(side="left", padx=(6, 4))
+        self.head_model_combo = ttk.Combobox(
+            r_split_top,
+            textvariable=self.head_model,
+            values=ALL_MODEL_NAMES,
+            state="readonly",
+            width=18,
+            font=("Microsoft YaHei UI", 8),
+        )
+        self.head_model_combo.pack(side="left", padx=(0, 8))
+        self.head_model_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_mode_panels())
+
+        self.dl_head_btn = self._make_sec_btn(
+            r_split_top,
+            "下载上模型",
+            lambda: self.download_specific_model_ui(self.head_model.get()),
+            width=self.RIGHT_BTN_W,
+            height=22,
+        )
+        self.dl_head_btn.pack(side="right")
+
+        r_split_bot = tk.Frame(self.split_container, bg=THEME["card"])
+        r_split_bot.pack(fill="x", pady=(0, 2))
+        tk.Label(
+            r_split_bot,
+            text="脖子以下(衣领/衣边)：",
+            bg=THEME["card"],
+            fg=THEME["text"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(side="left", padx=(6, 4))
+        self.body_model_combo = ttk.Combobox(
+            r_split_bot,
+            textvariable=self.body_model,
+            values=ALL_MODEL_NAMES,
+            state="readonly",
+            width=18,
+            font=("Microsoft YaHei UI", 8),
+        )
+        self.body_model_combo.pack(side="left", padx=(0, 8))
+        self.body_model_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_mode_panels())
+
+        self.dl_body_btn = self._make_sec_btn(
+            r_split_bot,
+            "下载下模型",
+            lambda: self.download_specific_model_ui(self.body_model.get()),
+            width=self.RIGHT_BTN_W,
+            height=22,
+        )
+        self.dl_body_btn.pack(side="right")
+
+        r_split_info = tk.Frame(self.split_container, bg=THEME["card"])
+        r_split_info.pack(fill="x", pady=(0, 2))
+        self.split_state_lbl = tk.Label(
+            r_split_info,
+            text="",
+            bg=THEME["card"],
+            fg=THEME["muted"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+        )
+        self.split_state_lbl.pack(side="left", padx=(6, 8))
+
+        tk.Label(
+            r_split_info,
+            text="分界微调(%):",
+            bg=THEME["card"],
+            fg=THEME["muted"],
+            font=("Microsoft YaHei UI", 8),
+        ).pack(side="left")
+        ttk.Spinbox(
+            r_split_info,
+            from_=-20,
+            to=20,
+            textvariable=self.neck_offset_pct,
+            width=4,
+            font=("Microsoft YaHei UI", 8),
+        ).pack(side="left", padx=(2, 0))
 
         self.mode_anchor = tk.Frame(set_card, bg=THEME["card"])
         self.mode_anchor.pack(fill="x")
 
+        # 尺寸与人脸裁剪行
+        r_size = tk.Frame(set_card, bg=THEME["card"])
+        r_size.pack(fill="x", pady=(4, 5))
+        tk.Label(r_size, text="照片尺寸：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 8)).pack(side="left")
+        self.size_combo = ttk.Combobox(
+            r_size,
+            textvariable=self.size_choice,
+            values=[s[0] for s in PHOTO_SIZES],
+            state="readonly",
+            width=18,
+            font=("Microsoft YaHei UI", 8),
+        )
+        self.size_combo.pack(side="left", padx=(4, 6))
+        self.size_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_size_custom_state())
+
+        self.custom_w_spin = ttk.Spinbox(r_size, from_=50, to=3000, textvariable=self.custom_w, width=5, font=("Microsoft YaHei UI", 8))
+        self.custom_w_spin.pack(side="left")
+        tk.Label(r_size, text="×", bg=THEME["card"], fg=THEME["muted"], font=("Microsoft YaHei UI", 8)).pack(side="left", padx=2)
+        self.custom_h_spin = ttk.Spinbox(r_size, from_=50, to=3000, textvariable=self.custom_h, width=5, font=("Microsoft YaHei UI", 8))
+        self.custom_h_spin.pack(side="left", padx=(0, 6))
+
+        tk.Checkbutton(
+            r_size,
+            text="自动人脸裁切",
+            variable=self.auto_crop,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            selectcolor="#EFF6FF",
+            activebackground=THEME["card"],
+            font=("Microsoft YaHei UI", 8),
+        ).pack(side="right")
+
+        # 亮度 / 对比度 / 6寸排版行
+        r_adj = tk.Frame(set_card, bg=THEME["card"])
+        r_adj.pack(fill="x", pady=(0, 5))
+        tk.Label(r_adj, text="亮度:", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 8)).pack(side="left")
+        ttk.Spinbox(r_adj, from_=-100, to=100, textvariable=self.brightness_val, width=5, font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(2, 8))
+        tk.Label(r_adj, text="对比度:", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 8)).pack(side="left")
+        ttk.Spinbox(r_adj, from_=-100, to=100, textvariable=self.contrast_val, width=5, font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(2, 10))
+        tk.Checkbutton(
+            r_adj,
+            text="6寸相纸排版（1800×1200）",
+            variable=self.layout_6in,
+            command=self._apply_name_lines_preview,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            selectcolor="#EFF6FF",
+            activebackground=THEME["card"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(side="right")
+
+        # 去红发丝与渐变背景行
         r_fine = tk.Frame(set_card, bg=THEME["card"])
-        r_fine.pack(fill="x", pady=(2, 5))
+        r_fine.pack(fill="x", pady=(0, 5))
         tk.Checkbutton(
             r_fine,
-            text="精细边缘保护（保留发丝与浅色衣物边缘，建议开启）",
+            text="去红发丝/护衣边",
             variable=self.fine_edge,
             bg=THEME["card"],
             fg=THEME["text"],
             selectcolor="#EFF6FF",
             activebackground=THEME["card"],
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(anchor="w")
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(side="left", padx=(0, 12))
+        tk.Checkbutton(
+            r_fine,
+            text="渐变背景（顶部→底部白色）",
+            variable=self.gradient_bg,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            selectcolor="#EFF6FF",
+            activebackground=THEME["card"],
+            font=("Microsoft YaHei UI", 8),
+        ).pack(side="left")
 
+        # 背景颜色行
         r1 = tk.Frame(set_card, bg=THEME["card"])
         r1.pack(fill="x", pady=(0, 5))
-        tk.Label(r1, text="背景颜色：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Label(r1, text="背景颜色：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 8)).pack(side="left")
         self.preset = ttk.Combobox(
             r1,
             values=list(PRESETS.keys()) + ["自定义颜色"],
             state="readonly",
             width=15,
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 8),
         )
         self.preset.set("蓝色（常用）")
         self.preset.pack(side="left", padx=(4, 8))
@@ -1882,7 +2626,7 @@ class App:
             text=self.color.get(),
             bg=THEME["card"],
             fg=THEME["text"],
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 8),
         )
         self.hex_label.pack(side="left")
 
@@ -1891,19 +2635,20 @@ class App:
             "自定义颜色",
             self.choose_color,
             width=self.RIGHT_BTN_W,
-            height=28,
+            height=23,
         ).pack(side="right")
 
+        # 输出格式与大小限制行
         r2 = tk.Frame(set_card, bg=THEME["card"])
-        r2.pack(fill="x", pady=(0, 4))
-        tk.Label(r2, text="输出格式：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
+        r2.pack(fill="x", pady=(0, 5))
+        tk.Label(r2, text="输出格式：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 8)).pack(side="left")
         self.format_combo = ttk.Combobox(
             r2,
             textvariable=self.output_format,
             values=["JPG", "PNG"],
             state="readonly",
             width=7,
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 8),
         )
         self.format_combo.pack(side="left", padx=(4, 12))
         self.format_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_name_lines_preview())
@@ -1917,7 +2662,7 @@ class App:
             fg=THEME["text"],
             selectcolor="#EFF6FF",
             activebackground=THEME["card"],
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=("Microsoft YaHei UI", 8, "bold"),
         ).pack(side="left", padx=(0, 4))
 
         self.max_kb_spin = ttk.Spinbox(
@@ -1926,7 +2671,7 @@ class App:
             to=5000,
             textvariable=self.max_kb,
             width=7,
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 8),
         )
         self.max_kb_spin.pack(side="left", padx=(2, 4))
         self.max_kb_unit_lbl = tk.Label(
@@ -1938,46 +2683,69 @@ class App:
         )
         self.max_kb_unit_lbl.pack(side="left")
 
+        # 并发线程与 GPU 加速行
         r_th = tk.Frame(set_card, bg=THEME["card"])
         r_th.pack(fill="x")
-        tk.Label(r_th, text="并发线程：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Label(r_th, text="并发线程：", bg=THEME["card"], fg=THEME["text"], font=("Microsoft YaHei UI", 8)).pack(side="left")
         ttk.Spinbox(
             r_th,
             from_=1,
             to=4,
             textvariable=self.thread_count,
-            width=6,
-            font=("Microsoft YaHei UI", 9),
+            width=5,
+            font=("Microsoft YaHei UI", 8),
         ).pack(side="left", padx=(4, 4))
-        tk.Label(r_th, text="线程（建议 1）", bg=THEME["card"], fg=THEME["muted"], font=("Microsoft YaHei UI", 8)).pack(side="left")
+        tk.Label(r_th, text="线程（建议 1）", bg=THEME["card"], fg=THEME["muted"], font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(0, 8))
 
-        # 卡片 3：导出位置
-        _, dir_card = self._make_pill_card(self.root, radius=22, outer_pady=(0, 6))
-        tk.Label(
-            dir_card,
-            text="导出位置（自动生成同名文件夹，如导入 16 则导出为 <所选位置>\\16）",
+        tk.Checkbutton(
+            r_th,
+            text="GPU 加速",
+            variable=self.use_gpu,
+            command=self._refresh_gpu_hint,
             bg=THEME["card"],
             fg=THEME["text"],
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(anchor="w", pady=(0, 3))
+            selectcolor="#EFF6FF",
+            activebackground=THEME["card"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(side="left")
+
+        _, _gpu_desc = detect_ort_providers(True)
+        self.gpu_status_lbl = tk.Label(
+            r_th,
+            text=f"[{_gpu_desc}]",
+            bg=THEME["card"],
+            fg=THEME["ok_green"] if "GPU" in _gpu_desc or "CUDA" in _gpu_desc else THEME["muted"],
+            font=("Microsoft YaHei UI", 8),
+        )
+        self.gpu_status_lbl.pack(side="left", padx=(4, 0))
+
+        # 3. 导出位置
+        _, dir_card = self._make_pill_card(main_stack, radius=20, outer_pady=(0, 3))
+        tk.Label(
+            dir_card,
+            text="导出位置（自动生成同名文件夹，如导入 16 则导出为 <所选位置>\16）",
+            bg=THEME["card"],
+            fg=THEME["text"],
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(anchor="w", pady=(0, 2))
 
         r3 = tk.Frame(dir_card, bg=THEME["card"])
         r3.pack(fill="x")
         out_pill = SoftPillField(
             r3,
-            height=28,
-            radius=14,
+            height=24,
+            radius=12,
             bg_color="#F8FAFC",
             border_color="#CBD5E1",
             parent_bg=THEME["card"],
             padx=10,
-            pady=3,
+            pady=2,
         )
         out_pill.canvas.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.out_entry = tk.Entry(
             out_pill.inner,
             textvariable=self.output_dir,
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 8),
             bg="#F8FAFC",
             fg=THEME["text"],
             relief="flat",
@@ -1985,44 +2753,44 @@ class App:
             highlightthickness=0,
         )
         self.out_entry.pack(fill="both", expand=True)
-        self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=78, height=28).pack(side="left", padx=(0, 6))
-        self._make_sec_btn(r3, "浏览", self.choose_output, width=78, height=28).pack(side="right")
+        self._make_sec_btn(r3, "原目录", self.use_source_dir_as_output, width=74, height=23).pack(side="left", padx=(0, 6))
+        self._make_sec_btn(r3, "浏览", self.choose_output, width=74, height=23).pack(side="right")
 
-        # 卡片 4：导出位置下方的“名称清单”输入框
-        _, name_card = self._make_pill_card(self.root, radius=22, outer_pady=(0, 2))
+        # 4. 名称清单
+        _, name_card = self._make_pill_card(main_stack, radius=20, outer_pady=(0, 3))
         name_top = tk.Frame(name_card, bg=THEME["card"])
-        name_top.pack(fill="x", pady=(0, 4))
+        name_top.pack(fill="x", pady=(0, 2))
         tk.Label(
             name_top,
             text="名称清单（每行一个新名称，支持直接粘贴表格一列或导入 TXT）",
             bg=THEME["card"],
             fg=THEME["text"],
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=("Microsoft YaHei UI", 8, "bold"),
         ).pack(side="left")
 
-        self._make_sec_btn(name_top, "清空", self.clear_names_text, width=68, height=24).pack(side="right")
-        self._make_sec_btn(name_top, "导入 TXT", self.import_names_txt, width=84, height=24).pack(side="right", padx=(0, 6))
+        self._make_sec_btn(name_top, "清空", self.clear_names_text, width=64, height=21).pack(side="right")
+        self._make_sec_btn(name_top, "导入 TXT", self.import_names_txt, width=80, height=21).pack(side="right", padx=(0, 6))
 
         name_pill = SoftPillField(
             name_card,
-            height=78,
-            radius=16,
+            height=64,
+            radius=14,
             bg_color="#F8FAFC",
             border_color="#CBD5E1",
             parent_bg=THEME["card"],
             padx=10,
             pady=4,
         )
-        name_pill.canvas.pack(fill="x")
+        name_pill.canvas.pack(fill="x", pady=(2, 4))
         self.name_text = tk.Text(
             name_pill.inner,
-            height=3,
+            height=2,
             bg="#F8FAFC",
             fg=THEME["text"],
             relief="flat",
             borderwidth=0,
             highlightthickness=0,
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 8),
             undo=True,
         )
         self.name_text.pack(fill="both", expand=True)
@@ -2035,16 +2803,16 @@ class App:
             fg=THEME["muted"],
             font=("Microsoft YaHei UI", 8),
         )
-        self.name_count_lbl.pack(anchor="w", pady=(3, 0))
+        self.name_count_lbl.pack(anchor="w", pady=(0, 0))
 
-        # 底部：单张进度条、总进度条、百分比、步骤说明、总体进度与当前照片名称
+        # 5. 底部双进度条与主按钮
         bottom = tk.Frame(self.root, bg=THEME["bg"])
-        bottom.pack(fill="x", padx=14, pady=(0, 10))
+        bottom.pack(side="bottom", fill="x", padx=14, pady=(2, 8))
 
-        tk.Frame(bottom, height=5, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
+        tk.Frame(bottom, height=2, bg=THEME["bg"], bd=0, highlightthickness=0).pack(fill="x")
 
         prog_row = tk.Frame(bottom, bg=THEME["bg"])
-        prog_row.pack(fill="x", pady=(0, 3))
+        prog_row.pack(fill="x", pady=(0, 2))
         tk.Label(
             prog_row,
             text="当前：",
@@ -2054,7 +2822,7 @@ class App:
         ).pack(side="left", padx=(0, 4))
         self.progress = SoftPillProgressBar(
             prog_row,
-            height=10,
+            height=9,
             track_color="#DCEAFF",
             fill_color=THEME["accent"],
             parent_bg=THEME["bg"],
@@ -2066,12 +2834,12 @@ class App:
             bg=THEME["bg"],
             fg=THEME["accent"],
             font=("Microsoft YaHei UI", 8, "bold"),
-            width=5,
+            width=6,
             anchor="e",
-        ).pack(side="right")
+        ).pack(side="right", padx=(0, 2))
 
         overall_prog_row = tk.Frame(bottom, bg=THEME["bg"])
-        overall_prog_row.pack(fill="x", pady=(0, 3))
+        overall_prog_row.pack(fill="x", pady=(0, 2))
         tk.Label(
             overall_prog_row,
             text="总计：",
@@ -2081,7 +2849,7 @@ class App:
         ).pack(side="left", padx=(0, 4))
         self.overall_progress = SoftPillProgressBar(
             overall_prog_row,
-            height=12,
+            height=11,
             track_color="#DBEAFE",
             fill_color="#1D4ED8",
             parent_bg=THEME["bg"],
@@ -2092,17 +2860,17 @@ class App:
             textvariable=self.overall_pct_text,
             bg=THEME["bg"],
             fg="#1D4ED8",
-            font=("Microsoft YaHei UI", 9, "bold"),
-            width=5,
+            font=("Microsoft YaHei UI", 8, "bold"),
+            width=6,
             anchor="e",
-        ).pack(side="right")
+        ).pack(side="right", padx=(0, 2))
 
         tk.Label(
             bottom,
             textvariable=self.status,
             bg=THEME["bg"],
             fg=THEME["text"],
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=("Microsoft YaHei UI", 8, "bold"),
             anchor="w",
         ).pack(fill="x", pady=(0, 1))
 
@@ -2113,15 +2881,15 @@ class App:
             fg=THEME["muted"],
             font=("Microsoft YaHei UI", 8),
             anchor="w",
-        ).pack(fill="x", pady=(0, 5))
+        ).pack(fill="x", pady=(0, 3))
 
         self.start_btn = SoftPillButton(
             bottom,
             text="开始批量处理",
             command=self.start,
-            width=590,
-            height=38,
-            radius=19,
+            width=600,
+            height=36,
+            radius=18,
             bg_color=THEME["accent"],
             hover_color=THEME["accent_hover"],
             fg_color="#FFFFFF",
@@ -2137,6 +2905,12 @@ class App:
 
         bottom.bind("<Configure>", _sync_start_width)
 
+    def _sync_size_custom_state(self):
+        is_custom = (self.size_choice.get() == "自定义尺寸")
+        st = "normal" if is_custom else "disabled"
+        self.custom_w_spin.configure(state=st)
+        self.custom_h_spin.configure(state=st)
+
     def _sync_size_limit_state(self):
         enabled = bool(self.limit_size_enabled.get())
         self.max_kb_spin.configure(state="normal" if enabled else "disabled")
@@ -2146,13 +2920,46 @@ class App:
             self.max_kb_unit_lbl.configure(text="KB（已关闭：原像素尺寸无限制输出）", fg=THEME["accent"])
 
     def _sync_mode_panels(self):
-        is_single = (self.mode_choice.get() == "single")
-        if is_single:
-            self.ensemble_container.pack_forget()
+        mode = self.mode_choice.get()
+        is_single = (mode == "single")
+        is_split = (mode == "split")
+
+        self.single_container.pack_forget()
+        self.split_container.pack_forget()
+        self.ensemble_container.pack_forget()
+
+        if is_split:
+            self.split_container.pack(fill="x", before=self.mode_anchor)
+        elif is_single:
             self.single_container.pack(fill="x", before=self.mode_anchor)
         else:
-            self.single_container.pack_forget()
             self.ensemble_container.pack(fill="x", before=self.mode_anchor)
+
+        hm = self.head_model.get()
+        bm = self.body_model.get()
+        h_ready = is_model_ready(hm)
+        b_ready = is_model_ready(bm)
+
+        self.dl_head_btn.set_text("上模型就绪" if h_ready else "下载上模型")
+        self.dl_head_btn.set_enabled((not h_ready) and (not self._is_downloading_model) and (not self._is_running))
+        self.dl_body_btn.set_text("下模型就绪" if b_ready else "下载下模型")
+        self.dl_body_btn.set_enabled((not b_ready) and (not self._is_downloading_model) and (not self._is_running))
+
+        if h_ready and b_ready:
+            self.split_state_lbl.configure(
+                text=f"分区就绪：上[{format_model_label(hm)}] + 下[{format_model_label(bm)}]",
+                fg=THEME["ok_green"],
+            )
+        else:
+            missing_parts = []
+            if not h_ready:
+                missing_parts.append(f"上:{hm}")
+            if not b_ready:
+                missing_parts.append(f"下:{bm}")
+            self.split_state_lbl.configure(
+                text=f"待下载：{' / '.join(missing_parts)}",
+                fg=THEME["err_red"],
+            )
 
         use_custom = bool(self.use_custom_model_path.get())
         self.custom_path_entry.configure(state="normal" if (is_single and use_custom) else "disabled")
@@ -2261,16 +3068,17 @@ class App:
         if value.upper() not in {v.upper() for v in PRESETS.values()}:
             self.preset.set("自定义颜色")
 
-    def download_selected_model_ui(self):
+    def download_specific_model_ui(self, target_model: str):
         if self._is_downloading_model or self._is_running:
             return
-        target_model = self.single_model.get()
         if is_model_ready(target_model):
             self._sync_mode_panels()
             return
 
         self._is_downloading_model = True
         self.download_model_btn.set_enabled(False)
+        self.dl_head_btn.set_enabled(False)
+        self.dl_body_btn.set_enabled(False)
         self.start_btn.set_enabled(False)
         self.status.set(f"正在通过国内镜像下载模型 [{target_model}] ……")
 
@@ -2288,6 +3096,9 @@ class App:
 
         threading.Thread(target=_dl_worker, daemon=True).start()
 
+    def download_selected_model_ui(self):
+        self.download_specific_model_ui(self.single_model.get())
+
     def _ask_conflict_or_done_policy(self, done_count: int, disk_exist_count: int, overlap_total: int, total_count: int) -> str | None:
         dlg = tk.Toplevel(self.root)
         dlg.title("已存在 / 已处理文件确认")
@@ -2295,7 +3106,6 @@ class App:
         dlg.grab_set()
         dlg.resizable(False, False)
         dlg.configure(bg=THEME["bg"])
-        center_window_on_screen(dlg, 410, 210)
 
         card = SoftPillCard(
             dlg,
@@ -2308,6 +3118,7 @@ class App:
             outer_pady=(10, 10),
         )
         box = card.inner
+        card.win_id and card.canvas.itemconfigure(card.win_id, width=380)
 
         choice = {"val": None}
 
@@ -2328,7 +3139,7 @@ class App:
 
         tk.Label(
             box,
-            text=f"{detail_str}\n请选择统一处理方式：",
+            text=f"{detail_str}请选择统一处理方式：",
             bg=THEME["card"],
             fg=THEME["muted"],
             font=("Microsoft YaHei UI", 9),
@@ -2387,19 +3198,45 @@ class App:
             parent_bg=THEME["card"],
         ).pack(side="left", padx=5)
 
+        dlg.update_idletasks()
+        card.canvas.configure(width=416)
+        card._redraw()
+        dlg.update_idletasks()
+        req_w = 436
+        req_h = max(168, dlg.winfo_reqheight() + 8)
+        left, top, right, bottom = _get_workarea_bounds(dlg)
+        work_w = max(320, right - left)
+        work_h = max(320, bottom - top)
+        dx = left + max(0, (work_w - req_w) // 2)
+        dy = top + max(0, (work_h - req_h) // 2)
+        dlg.geometry(f"{req_w}x{req_h}+{dx}+{dy}")
+
         dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(None))
         self.root.wait_window(dlg)
         return choice["val"]
 
     def _get_target_model_specs(self):
-        if self.mode_choice.get() == "single":
+        mode = self.mode_choice.get()
+        if mode == "split":
+            hm = self.head_model.get()
+            bm = self.body_model.get()
+            return [(hm, 1.0, ""), (bm, 1.0, "")]
+        if mode == "single":
             m_name = self.single_model.get()
             custom_p = self.custom_model_file.get().strip() if self.use_custom_model_path.get() else ""
             return [(m_name, 1.0, custom_p)]
         specs = ENSEMBLE_PRESETS.get(self.ensemble_choice.get(), ENSEMBLE_PRESETS["双模型叠加 (birefnet + isnet)"])
         return [(m_name, w, "") for m_name, w in specs]
 
-    def _build_session_for_spec(self, m_name: str, custom_p: str):
+    def _create_session_with_providers(self, m_name: str, providers: list[str] | None = None):
+        if providers:
+            try:
+                return new_session(m_name, providers=providers)
+            except TypeError:
+                return new_session(m_name)
+        return new_session(m_name)
+
+    def _build_session_for_spec(self, m_name: str, custom_p: str, providers: list[str] | None = None):
         if custom_p:
             src_onnx = Path(custom_p)
             if not src_onnx.is_file():
@@ -2409,7 +3246,7 @@ class App:
             linked_onnx = target_dir / f"{m_name}.onnx"
             if src_onnx.resolve() != linked_onnx.resolve():
                 shutil.copy2(src_onnx, linked_onnx)
-        return new_session(m_name)
+        return self._create_session_with_providers(m_name, providers=providers)
 
     def start(self):
         if self._is_running or self._is_downloading_model or self._closing:
@@ -2450,17 +3287,18 @@ class App:
         if missing_models:
             messagebox.showwarning(
                 "模型尚未就绪",
-                f"当前任务需要模型：{', '.join(missing_models)}\n\n"
+                f"当前任务需要模型：{', '.join(missing_models)}"
                 f"请先在“抠图模型”中下载该模型，或勾选“自定义路径”选择对应的 .onnx 文件。",
             )
             return
 
         self._apply_name_lines_preview()
         name_snapshot = list(self._name_lines)
-        ext = self._current_ext()
+        params = self._snapshot_process_params()
+        ext = params["ext"]
+        layout_6in = params["layout_6in"]
         input_paths_snapshot = list(self.input_paths)
 
-        # 建立每张图的任务元组：(idx, src, custom_stem, out_dir_override)
         task_entries = []
         for idx, p in enumerate(all_images):
             key = str(p.resolve())
@@ -2481,7 +3319,9 @@ class App:
             key = str(p.resolve())
             if self._img_states.get(key) == "ok":
                 done_set.add(key)
-            _, target_file = compute_target_output_path(p, input_paths_snapshot, base_out, ext, c_stem, out_override)
+            _, target_file = compute_target_output_path(
+                p, input_paths_snapshot, base_out, ext, c_stem, out_override, layout_6in=layout_6in
+            )
             if target_file.exists():
                 disk_exist_set.add(key)
 
@@ -2522,16 +3362,14 @@ class App:
             self._refresh_list_view(all_images)
 
         prepare_models_env()
-        fmt = (self.output_format.get() or "JPG").upper()
-        fine_edge = bool(self.fine_edge.get())
-        limit_enabled = bool(self.limit_size_enabled.get())
-        max_kb_val = int(self.max_kb.get())
 
         self._is_running = True
         first_model_label = format_model_label(target_specs[0][0])
         first_photo_name = tasks_to_run[0][1].name if tasks_to_run else "无"
         self.start_btn.set_enabled(False)
         self.download_model_btn.set_enabled(False)
+        self.dl_head_btn.set_enabled(False)
+        self.dl_body_btn.set_enabled(False)
         self.pick_onnx_btn.set_enabled(False)
         init_o_pct = self._calc_overall_pct(0, len(tasks_to_run), 10.0)
         self._update_progress_display(
@@ -2543,7 +3381,7 @@ class App:
 
         threading.Thread(
             target=self._worker,
-            args=(tasks_to_run, input_paths_snapshot, base_out, rgb, fmt, limit_enabled, max_kb_val, target_specs, fine_edge, workers, ext),
+            args=(tasks_to_run, input_paths_snapshot, base_out, rgb, target_specs, params, workers),
             daemon=True,
         ).start()
 
@@ -2558,165 +3396,84 @@ class App:
             cut_img.close()
         return alpha
 
-    def _stabilize_alpha(self, alpha_img):
-        """轻度修补蒙版中的小孔洞，不再用过小闭运算假装修复大块衣物缺失。"""
-        flt = ImageFilter
-        if flt is None:
-            from PIL import ImageFilter as _flt
-            flt = _flt
-        # 仅做很轻的局部平滑，避免把头发和衣服边缘过度膨胀。
-        soft = alpha_img.filter(flt.MaxFilter(size=3)).filter(flt.MinFilter(size=3))
-        if HAS_NUMPY:
-            a = np.asarray(alpha_img, dtype=np.float32)
-            b = np.asarray(soft, dtype=np.float32)
-            out = np.maximum(a, 0.35 * b + 0.65 * a)
-            res = Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="L")
-            soft.close()
-            return res
-        return soft
+    def _split_head_body_alpha(self, im_rgba, head_sess, body_sess, offset_ratio: float = 0.0, step_cb=None):
+        w, h = im_rgba.size
+        if callable(step_cb):
+            step_cb(28.0, "头部模型：分析完整照片中的头发与脸部边缘（28%）")
+        head_alpha = self._run_model_alpha(im_rgba, head_sess).resize(
+            (w, h), Image.Resampling.BILINEAR
+        )
+        if callable(step_cb):
+            step_cb(52.0, "服装模型：分析完整照片中的衣领与肩部轮廓（52%）")
+        body_alpha = self._run_model_alpha(im_rgba, body_sess).resize(
+            (w, h), Image.Resampling.BILINEAR
+        )
 
-    def _estimate_border_color(self, rgb_arr):
-        """从四周窄边估计原始背景颜色，适用于常见纯色证件照背景。"""
-        h, w = rgb_arr.shape[:2]
-        t = max(2, min(12, int(round(min(h, w) * 0.012))))
-        border = np.concatenate((
-            rgb_arr[:t, :, :].reshape(-1, 3),
-            rgb_arr[-t:, :, :].reshape(-1, 3),
-            rgb_arr[:, :t, :].reshape(-1, 3),
-            rgb_arr[:, -t:, :].reshape(-1, 3),
-        ), axis=0)
-        # 中位数比均值更不容易被头发/肩膀碰到画面边缘的少量像素污染。
-        return np.median(border, axis=0).astype(np.float32)
-
-    def _refine_alpha_single_model(self, im_rgba, alpha_img):
-        """
-        单模型专用蒙版修复：
-        1) 估计照片四周的原背景颜色；
-        2) 只在 AI 人像框附近寻找“颜色明显不像背景、但 alpha 被压低”的像素；
-        3) 有 OpenCV 时用 GrabCut 在局部区域做前景/背景判别；
-        4) 修复只作用于疑似漏抠区，不整体膨胀人物轮廓。
-
-        这是针对纯色证件照背景的保守补救，不会把整张照片的白色区域一概当成人物。
-        """
         if not HAS_NUMPY:
-            return self._stabilize_alpha(alpha_img)
+            return head_alpha
 
-        rgba = np.asarray(im_rgba, dtype=np.uint8)
-        rgb = rgba[:, :, :3]
-        original = np.asarray(alpha_img, dtype=np.uint8)
-        h, w = original.shape
-        if min(h, w) < 64:
-            return self._stabilize_alpha(alpha_img)
+        head_arr = np.asarray(head_alpha, dtype=np.float32)
+        body_arr = np.asarray(body_alpha, dtype=np.float32)
+        head_alpha.close()
+        body_alpha.close()
 
-        # 人像蒙版边界框，外扩以覆盖被误删的肩部边缘。
-        ys, xs = np.where(original > 24)
-        if len(xs) < 100:
-            return self._stabilize_alpha(alpha_img)
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
-        padx = max(8, int(w * 0.10))
-        pady = max(8, int(h * 0.035))
-        x0, x1 = max(0, x0 - padx), min(w, x1 + padx)
-        y0, y1 = max(0, y0 - pady), min(h, y1 + pady)
+        split_y = estimate_neck_split_y(im_rgba, offset_ratio=offset_ratio)
+        band = max(24, int(h * 0.18))
+        y = np.arange(h, dtype=np.float32)
+        t = np.clip((y - (split_y - band * 0.5)) / max(1.0, float(band)), 0.0, 1.0)
+        body_weight = (t * t * (3.0 - 2.0 * t)).reshape(h, 1)
+        head_weight = 1.0 - body_weight
 
-        bg_rgb = self._estimate_border_color(rgb)
-        # RGB 距离对典型蓝/红/白纯色底足够稳定；阈值采用保守值。
-        color_dist = np.sqrt(np.sum((rgb.astype(np.float32) - bg_rgb[None, None, :]) ** 2, axis=2))
-        roi_alpha = original[y0:y1, x0:x1]
-        roi_dist = color_dist[y0:y1, x0:x1]
-        roi_rgb = rgb[y0:y1, x0:x1]
+        fused = head_arr * head_weight + body_arr * body_weight
+        lower_zone = (y >= split_y).reshape(h, 1)
+        fused = np.where(lower_zone, np.maximum(head_arr, body_arr), fused)
 
-        # 背景色差异较大的低 alpha 像素是优先恢复对象，白色衣服对蓝底通常有很大色差。
-        # 不对 alpha 已经很高的区域动刀，也不扩张到人像框之外。
-        candidate = (roi_alpha < 105) & (roi_dist > 34.0)
-        if int(candidate.sum()) < max(24, int(candidate.size * 0.00008)):
-            return self._stabilize_alpha(alpha_img)
-
-        if HAS_OPENCV:
-            try:
-                # GrabCut 在 ROI 中以 AI 蒙版作先验，以边缘背景色作背景种子。
-                # 先构造四分类蒙版：确定背景/确定前景/可能背景/可能前景。
-                gc_mask = np.full(roi_alpha.shape, cv2.GC_PR_BGD, dtype=np.uint8)
-                gc_mask[roi_alpha >= 225] = cv2.GC_FGD
-                gc_mask[(roi_alpha >= 65) & (roi_alpha < 225)] = cv2.GC_PR_FGD
-                # 仅将“与边缘背景相近”的区域设为可能背景；疑似白衣漏抠区域保持可能前景。
-                gc_mask[(roi_dist < 23.0) & (roi_alpha < 65)] = cv2.GC_PR_BGD
-                gc_mask[candidate] = cv2.GC_PR_FGD
-
-                # ROI 四周仍与原图边缘相接、且颜色接近背景的像素作为确定背景种子。
-                bg_like = (roi_dist < 18.0).astype(np.uint8)
-                n, labels = cv2.connectedComponents(bg_like, connectivity=8)
-                edge_labels = np.concatenate((
-                    labels[0, :][bg_like[0, :] > 0],
-                    labels[-1, :][bg_like[-1, :] > 0],
-                    labels[:, 0][bg_like[:, 0] > 0],
-                    labels[:, -1][bg_like[:, -1] > 0],
-                ))
-                border_labels = set(np.unique(edge_labels).tolist()) if edge_labels.size else set()
-                border_labels.discard(0)
-                if border_labels:
-                    connected_bg = np.isin(labels, list(border_labels)) & (roi_alpha < 80)
-                    gc_mask[connected_bg] = cv2.GC_BGD
-
-                # 保护 AI 高置信度前景，避免 GrabCut 把深色头发/衣服重新判成背景。
-                gc_mask[roi_alpha >= 245] = cv2.GC_FGD
-                bgr = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2BGR)
-                bgd_model = np.zeros((1, 65), np.float64)
-                fgd_model = np.zeros((1, 65), np.float64)
-                cv2.grabCut(bgr, gc_mask, None, bgd_model, fgd_model, 2, cv2.GC_INIT_WITH_MASK)
-                gc_fg = (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD)
-                # 只接受位于颜色差异候选区的恢复结果，避免整体轮廓变胖。
-                recovered = gc_fg & candidate
-                if recovered.any():
-                    # 让新恢复的衣料区域保留柔和边缘，内部达到较高不透明度。
-                    rec = cv2.GaussianBlur(recovered.astype(np.float32), (0, 0), sigmaX=0.85)
-                    rec_alpha = np.clip(rec * 235.0, 0, 235).astype(np.uint8)
-                    roi_alpha = np.maximum(roi_alpha, rec_alpha)
-                    refined = original.copy()
-                    refined[y0:y1, x0:x1] = roi_alpha
-                    # 最后只做半径很小的边缘平滑。
-                    out = Image.fromarray(refined, mode="L").filter(ImageFilter.GaussianBlur(radius=0.35))
-                    return out
-            except Exception:
-                # GrabCut 失败时继续走下面的保守备用策略。
-                pass
-
-        # 无 OpenCV/GrabCut 失败时，不进行激进的颜色补全，避免把背景误判成人体。
-        return self._stabilize_alpha(alpha_img)
-
-    def _fuse_alphas(self, im_rgba, weighted_sessions, fine_edge=True, step_cb=None):
-        # 当前用户采用单模型模式时，严格只运行所选模型，不再叠加其他模型。
         if callable(step_cb):
-            step_cb(30.0, "正在进行 AI 人像识别（30%）")
-        raw_a = self._run_model_alpha(im_rgba, weighted_sessions[0][2])
+            step_cb(70.0, "正在融合头发、颈部与服装蒙版（70%）")
+        return Image.fromarray(np.clip(fused, 0, 255).astype(np.uint8), mode="L")
+
+    def _fuse_alphas(self, im_rgba, weighted_sessions, fine_edge=True, step_cb=None, params=None):
+        mode = (params or {}).get("mode_choice", "single")
+        if mode == "split" and len(weighted_sessions) >= 2:
+            raw_a = self._split_head_body_alpha(
+                im_rgba=im_rgba,
+                head_sess=weighted_sessions[0][2],
+                body_sess=weighted_sessions[1][2],
+                offset_ratio=float((params or {}).get("neck_offset_ratio", 0.0)),
+                step_cb=step_cb,
+            )
+            if callable(step_cb):
+                step_cb(70.0, "正在平滑融合颈部接缝与边缘蒙版（70%）")
+            return raw_a
+
         if callable(step_cb):
-            step_cb(70.0, "正在优化头发、肩膀和衣服边缘（70%）")
-        try:
-            refined = self._refine_alpha_single_model(im_rgba, raw_a) if fine_edge else self._stabilize_alpha(raw_a)
-        finally:
-            try:
-                raw_a.close()
-            except Exception:
-                pass
-        return refined
+            step_cb(30.0, "正在进行 AI 人像抠图（30%）")
+        if len(weighted_sessions) == 1 or not HAS_NUMPY:
+            raw_a = self._run_model_alpha(im_rgba, weighted_sessions[0][2])
+        else:
+            w, h = im_rgba.size
+            acc = np.zeros((h, w), dtype=np.float32)
+            w_sum = 0.0
+            for _, weight, sess in weighted_sessions:
+                a_i = self._run_model_alpha(im_rgba, sess).resize((w, h), Image.Resampling.BILINEAR)
+                acc += np.asarray(a_i, dtype=np.float32) * float(weight)
+                w_sum += float(weight)
+                a_i.close()
+            if w_sum > 0:
+                acc /= w_sum
+            raw_a = Image.fromarray(np.clip(acc, 0, 255).astype(np.uint8), mode="L")
+        if callable(step_cb):
+            step_cb(70.0, "正在整理边缘蒙版（70%）")
+        return raw_a
 
-    def _clean_fringe_and_composite(self, im_rgba, alpha_img, rgb, fine_edge):
-        """按真实 alpha 合成；不再把所有高亮边缘强行染成新底色，避免白衣/肩部被洗色。"""
-        if HAS_NUMPY:
-            src = np.asarray(im_rgba, dtype=np.float32)[:, :, :3]
-            a = np.asarray(alpha_img, dtype=np.float32) / 255.0
-            bg = np.asarray(rgb, dtype=np.float32).reshape(1, 1, 3)
-            out = src * a[:, :, None] + bg * (1.0 - a[:, :, None])
-            return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="RGB")
-
-        cut = im_rgba.copy()
-        cut.putalpha(alpha_img)
-        bg = Image.new("RGBA", cut.size, (*rgb, 255))
-        bg.alpha_composite(cut)
-        result = bg.convert("RGB")
-        bg.close()
-        cut.close()
-        return result
+    def _clean_fringe_and_composite(self, im_rgba, alpha_img, rgb, fine_edge, gradient_bg=False):
+        return self.hair_spill_module.process(
+            im_rgba=im_rgba,
+            alpha_img=alpha_img,
+            bg_rgb=rgb,
+            clean_edge=fine_edge,
+            gradient=gradient_bg,
+        )
 
     def _process_single_image(
         self,
@@ -2726,35 +3483,53 @@ class App:
         weighted_sessions,
         base_out: Path,
         rgb,
-        fmt,
-        limit_enabled: bool,
-        max_kb: int,
-        fine_edge: bool,
-        ext: str,
+        params: dict,
         override_dir: Path | None = None,
         step_cb=None,
     ):
         im = None
         a_ch = None
+        composed = None
         result = None
+        layout_img = None
         try:
             if callable(step_cb):
                 step_cb(15.0, "正在读取照片（15%）")
             im = ImageOps.exif_transpose(Image.open(src)).convert("RGBA")
 
-            a_ch = self._fuse_alphas(im, weighted_sessions, fine_edge, step_cb=step_cb)
+            a_ch = self._fuse_alphas(im, weighted_sessions, params["fine_edge"], step_cb=step_cb, params=params)
 
             if callable(step_cb):
-                step_cb(85.0, "正在合成新背景（85%）")
-            result = self._clean_fringe_and_composite(im, a_ch, rgb, fine_edge)
+                step_cb(82.0, "正在恢复浅色衣物并清理背景色边缘（82%）")
+            composed = self._clean_fringe_and_composite(
+                im, a_ch, rgb, params["fine_edge"], gradient_bg=params["gradient_bg"]
+            )
+
+            if params["brightness"] != 0 or params["contrast"] != 0:
+                composed = apply_brightness_contrast_pil(composed, params["brightness"], params["contrast"])
+
+            if params["target_w"] > 0 and params["target_h"] > 0:
+                composed = fit_photo_size_pil(composed, params["target_w"], params["target_h"], auto_crop=params["auto_crop"])
+
+            if params["layout_6in"]:
+                layout_img = create_6in_layout_pil(composed)
+                final_img = layout_img
+            else:
+                final_img = composed
 
             if callable(step_cb):
                 step_cb(95.0, "正在保存图片（95%）")
             out_folder, target = compute_target_output_path(
-                src, input_paths, base_out, ext, c_stem, override_dir=override_dir
+                src,
+                input_paths,
+                base_out,
+                params["ext"],
+                c_stem,
+                override_dir=override_dir,
+                layout_6in=params["layout_6in"],
             )
             target.parent.mkdir(parents=True, exist_ok=True)
-            data = encode_image_output(result, fmt, limit_enabled, max_kb)
+            data = encode_image_output(final_img, params["fmt"], params["limit_enabled"], params["max_kb"])
             target.write_bytes(data)
             self._last_output_files[str(src.resolve())] = target
 
@@ -2762,14 +3537,14 @@ class App:
                 step_cb(100.0, "当前照片处理完成（100%）")
             return out_folder, target.name
         finally:
-            for obj in (result, a_ch, im):
+            for obj in (layout_img, result, composed, a_ch, im):
                 if obj is not None:
                     try:
                         obj.close()
                     except Exception:
                         pass
 
-    def _worker(self, tasks_to_run, input_paths, base_out, rgb, fmt, limit_enabled, max_kb, target_specs, fine_edge, workers, ext):
+    def _worker(self, tasks_to_run, input_paths, base_out, rgb, target_specs, params, workers):
         weighted_sessions = []
         executor = None
         total_tasks = len(tasks_to_run)
@@ -2794,12 +3569,12 @@ class App:
                     o_pct,
                 ))
                 try:
-                    sess = self._build_session_for_spec(m_name, custom_p)
+                    sess = self._build_session_for_spec(m_name, custom_p, providers=params.get("ort_providers"))
                     weighted_sessions.append((m_name, weight, sess))
                 except Exception as e:
                     self.msgq.put((
                         "fatal",
-                        f"AI 模型 [{m_name}] 加载失败：{e}\n模型目录：{get_model_subdir(m_name)}",
+                        f"AI 模型 [{m_name}] 加载失败：{e}模型目录：{get_model_subdir(m_name)}",
                     ))
                     return
 
@@ -2847,11 +3622,7 @@ class App:
                     weighted_sessions,
                     base_out,
                     rgb,
-                    fmt,
-                    limit_enabled,
-                    max_kb,
-                    fine_edge,
-                    ext,
+                    params,
                     out_override,
                     _make_step_cb(src.name),
                 ): (idx, src, c_stem)
@@ -2904,7 +3675,7 @@ class App:
                 self.msgq.put(("done", ok, total_tasks, errors, summary_out))
         except Exception:
             if not self._closing:
-                self.msgq.put(("fatal", f"后台处理线程发生未捕获异常：\n{traceback.format_exc()}"))
+                self.msgq.put(("fatal", f"后台处理线程发生未捕获异常：{traceback.format_exc()}"))
         finally:
             if executor is not None:
                 try:
@@ -2918,6 +3689,27 @@ class App:
                     pass
             weighted_sessions.clear()
             gc.collect()
+
+    def _fit_window_to_content_and_screen(self):
+        if self._closing or not self.root.winfo_exists():
+            return
+        try:
+            self.root.update_idletasks()
+            req_h = self.root.winfo_reqheight()
+            cur_w = max(600, self.root.winfo_width())
+            left, top, right, bottom = _get_workarea_bounds(self.root)
+            work_w = max(320, right - left)
+            work_h = max(320, bottom - top)
+            # Appropriately lengthen within available workarea above taskbar/status bar
+            max_allowed_h = max(320, work_h - 12)
+            desired_h = max(req_h + 6, 900)
+            target_h = min(desired_h, max_allowed_h)
+            target_w = min(max(cur_w, 740), work_w)
+            x = left + max(0, (work_w - target_w) // 2)
+            y = top + max(0, min(work_h - target_h - 6, int((work_h - target_h) * 0.20)))
+            self.root.geometry(f"{target_w}x{target_h}+{x}+{y}")
+        except Exception:
+            pass
 
     def _poll(self):
         if self._closing:
@@ -2938,10 +3730,10 @@ class App:
                     self._sync_mode_panels()
                     if ok_flag:
                         self.status.set(f"模型 [{m_name}] 已下载就绪")
-                        messagebox.showinfo("下载完成", f"模型 [{m_name}] 已下载并准备就绪：\n{info_str}")
+                        messagebox.showinfo("下载完成", f"模型 [{m_name}] 已下载并准备就绪：{info_str}")
                     else:
                         self.status.set(f"模型 [{m_name}] 下载失败")
-                        messagebox.showerror("下载失败", f"模型 [{m_name}] 下载出错：\n{info_str}")
+                        messagebox.showerror("下载失败", f"模型 [{m_name}] 下载出错：{info_str}")
                 elif kind == "item_done":
                     _, src, state, v, total, msg, overall_str, o_pct = item
                     self._mark_image_state(src, state)
@@ -2978,9 +3770,9 @@ class App:
                         f"总体进度：100%（已完成 {ok}/{total} 张） | 当前照片：全部完成",
                         overall_pct=100.0,
                     )
-                    msg = f"处理完成！\n成功：{ok}/{total} 张\n导出文件夹：{out_summary}"
+                    msg = f"处理完成！成功：{ok}/{total} 张导出文件夹：{out_summary}"
                     if errors:
-                        msg += "\n\n部分失败原因（最多显示 5 条）：\n" + "\n".join(errors[:5])
+                        msg += "部分失败原因（最多显示 5 条）：" + "".join(errors[:5])
                     messagebox.showinfo("处理完成", msg)
         except queue.Empty:
             pass
@@ -3039,7 +3831,7 @@ def main():
         def finish_load(err_msg=None):
             splash.close()
             if err_msg:
-                messagebox.showerror("启动失败", f"组件加载出错：\n{err_msg}")
+                messagebox.showerror("启动失败", f"组件加载出错：{err_msg}")
                 root.destroy()
                 os._exit(1)
             root.deiconify()
@@ -3089,7 +3881,7 @@ def main():
         root.mainloop()
     except Exception as e:
         try:
-            messagebox.showerror("启动异常", f"程序启动出错：\n{e}")
+            messagebox.showerror("启动异常", f"程序启动出错：{e}")
         except Exception:
             pass
         os._exit(1)
